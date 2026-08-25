@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import logging
+import os
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -27,6 +28,25 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
+def _managed_huggingface_environment(config: DwellConfig) -> Iterator[None]:
+    managed = {
+        "HF_HOME": str(config.hf_home),
+        "HF_HUB_CACHE": str(config.hf_hub_cache),
+        "HF_XET_CACHE": str(config.hf_xet_cache),
+    }
+    previous = {name: os.environ.get(name) for name in managed}
+    os.environ.update(managed)
+    try:
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+
+@contextmanager
 def _exclusive_lock(path: Path, message: str) -> Iterator[None]:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a+", encoding="utf-8") as lock:
@@ -49,6 +69,10 @@ class InstallPlan(BaseModel):
     revision: str | None
     destination: str
     estimated_size_gb: float | None
+    license_url: str | None
+    acceptable_use_url: str | None
+    minimum_memory_gb: float | None
+    memory_notes: str | None
     required_files: tuple[str, ...]
     downloadable: bool
     already_installed: bool
@@ -109,6 +133,10 @@ class ModelManager:
             revision=source.revision,
             destination=destination,
             estimated_size_gb=source.estimated_size_gb,
+            license_url=source.license_url,
+            acceptable_use_url=source.acceptable_use_url,
+            minimum_memory_gb=definition.profile.minimum_memory_gb,
+            memory_notes=definition.profile.memory,
             required_files=source.required_files,
             downloadable=self.registry.source_available(model_id),
             already_installed=installation.installed,
@@ -138,22 +166,26 @@ class ModelManager:
 
             # This is the only network-capable code path in Dwell. It is reached
             # solely from the explicit install command, never listing or inference.
-            from huggingface_hub import snapshot_download
+            # hf-xet reads its chunk-cache location from the process environment
+            # when its native session is created. Pin all managed Hugging Face
+            # caches before the lazy import so no model data escapes DWELL_HOME.
+            with _managed_huggingface_environment(self.config):
+                from huggingface_hub import snapshot_download
 
-            self.config.ensure_layout()
-            logger.info(
-                "Installing model %s from %s at revision %s",
-                model_id,
-                plan.repository,
-                plan.revision,
-            )
-            snapshot_download(
-                repo_id=plan.repository,
-                revision=plan.revision,
-                cache_dir=self.config.hf_hub_cache,
-                local_files_only=False,
-                allow_patterns=list(plan.required_files),
-            )
+                self.config.ensure_layout()
+                logger.info(
+                    "Installing model %s from %s at revision %s",
+                    model_id,
+                    plan.repository,
+                    plan.revision,
+                )
+                snapshot_download(
+                    repo_id=plan.repository,
+                    revision=plan.revision,
+                    cache_dir=self.config.hf_hub_cache,
+                    local_files_only=False,
+                    allow_patterns=list(plan.required_files),
+                )
             installation = self.registry.installation(model_id)
             if not installation.installed:
                 raise DwellError(

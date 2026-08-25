@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -53,6 +56,22 @@ def test_bundled_registry_is_truthful_about_unconfigured_q8(tmp_path: Path) -> N
         manager.install("ltx-2.5-q8")
 
 
+def test_bundled_bf16_install_plan_has_verified_size_and_usage_terms(tmp_path: Path) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    manager = ModelManager(config, registry=ModelRegistry.load(config))
+
+    plan = manager.install_plan("ltx-2.5-bf16")
+
+    assert plan.estimated_size_gb == 71.0
+    assert plan.minimum_memory_gb == 48.0
+    assert plan.license_url and plan.license_url.endswith("/LICENSE.md")
+    assert plan.acceptable_use_url == (
+        "https://static.lightricks.com/legal/ltx-acceptable-use-policy.pdf"
+    )
+    assert "transformer-distilled.safetensors" in plan.required_files
+    assert "transformer-dev.safetensors" not in plan.required_files
+
+
 def test_partial_and_zero_byte_files_are_never_installed(tmp_path: Path) -> None:
     config = DwellConfig(home=tmp_path / "dwell")
     repo, snapshot = _snapshot(config)
@@ -95,3 +114,47 @@ def test_complete_local_snapshot_resolves_without_network(tmp_path: Path) -> Non
     assert installation.installed is True
     assert installation.partial is False
     assert registry.resolve_local_path("test-video") == snapshot.resolve()
+
+
+def test_explicit_install_pins_hub_and_xet_caches_under_dwell_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    registry = ModelRegistry(config, definitions=[_definition("config.json")])
+    manager = ModelManager(config, registry=registry)
+    observed: dict[str, str] = {}
+
+    def fake_snapshot_download(**kwargs: object) -> None:
+        observed.update(
+            {
+                "HF_HOME": os.environ["HF_HOME"],
+                "HF_HUB_CACHE": os.environ["HF_HUB_CACHE"],
+                "HF_XET_CACHE": os.environ["HF_XET_CACHE"],
+                "cache_dir": str(kwargs["cache_dir"]),
+            }
+        )
+        _repo, snapshot = _snapshot(config)
+        (snapshot / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setenv("HF_XET_CACHE", str(tmp_path / "outside"))
+    previous_home = os.environ.get("HF_HOME")
+    previous_hub = os.environ.get("HF_HUB_CACHE")
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    result = manager.install("test-video")
+
+    assert result.installed is True
+    assert observed == {
+        "HF_HOME": str(config.hf_home),
+        "HF_HUB_CACHE": str(config.hf_hub_cache),
+        "HF_XET_CACHE": str(config.hf_xet_cache),
+        "cache_dir": str(config.hf_hub_cache),
+    }
+    assert os.environ.get("HF_HOME") == previous_home
+    assert os.environ.get("HF_HUB_CACHE") == previous_hub
+    assert os.environ["HF_XET_CACHE"] == str(tmp_path / "outside")

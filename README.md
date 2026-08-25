@@ -49,6 +49,53 @@ so `models load` reports readiness rather than pretending the model is loaded. `
 truthfully reports that there is no persistent runtime state to release. The runtime capability
 interface allows a future in-process or resident engine to implement real load/unload behavior.
 
+## Installation with Homebrew
+
+The repository is private, so first make sure your GitHub account has access and your SSH key can
+authenticate to GitHub. Then install Dwell on an Apple Silicon Mac without cloning the repository
+manually:
+
+```bash
+brew tap oktykrk/dwell git@github.com:oktykrk/dwell.git
+brew install dwell
+dwell setup
+dwell models install ltx-2.5-bf16
+dwell start
+dwell status
+```
+
+`brew install` installs the Dwell CLI and its system dependencies in Homebrew's managed prefix.
+`dwell setup` prepares the per-user runtime under `~/.dwell`; it does not download model weights,
+start the server, or edit `.zshrc` or any other shell configuration. Model weights are downloaded
+only by the explicit `dwell models install …` command.
+
+### Updating a Homebrew installation
+
+```bash
+brew update
+brew upgrade dwell
+dwell setup --upgrade
+dwell doctor
+```
+
+The setup upgrade updates the pinned runtime while preserving models, generated outputs, and job
+data.
+
+### Uninstalling Homebrew Dwell
+
+```bash
+dwell stop
+brew uninstall dwell
+```
+
+`brew uninstall` removes the packaged CLI but does not delete user data. In particular,
+`~/.dwell/models`, outputs, state, and logs are preserved. Automatic data deletion is intentionally
+outside the MVP.
+
+> **Warning:** To remove all Dwell data manually, run `rm -rf "$HOME/.dwell"` only after checking
+> that the path is correct and retaining anything you need. This permanently deletes downloaded
+> models, generated outputs, job state, configuration, runtimes, and logs and cannot be undone.
+
 ## Installation for development
 
 Python 3.11 and [`uv`](https://docs.astral.sh/uv/) are expected.
@@ -61,15 +108,16 @@ uv run dwell --help
 The operational home defaults to `~/.dwell`. Source code may live elsewhere; caches, runtimes,
 state, logs, temporary artifacts, and outputs remain under the operational home.
 
-To make the command available in a shell, install the project or link the generated environment
-entry point into `~/.dwell/bin`, then ensure that directory is on `PATH`.
+For development, `uv run dwell …` uses the project environment. A Homebrew installation links
+`dwell` into Homebrew's normal `bin` directory; `~/.dwell/bin` and shell startup-file edits are not
+required.
 
 ## Directory layout
 
 ```text
 ~/.dwell/
 ├── models/
-│   └── huggingface/       shared HF_HOME (hub cache structure is preserved)
+│   └── huggingface/       shared HF_HOME (Hub and Xet caches are preserved)
 ├── runtimes/
 │   └── ltx-2-mlx/         external runtime; remains its own Git repository
 ├── services/
@@ -84,7 +132,7 @@ entry point into `~/.dwell/bin`, then ensure that directory is on `PATH`.
 ├── tmp/
 │   └── ltx-tests/
 ├── config/                editable central model registry
-└── bin/                    local CLI entry point
+└── bin/                    reserved for local helpers; not required on PATH
 ```
 
 Model caches, runtime repositories, generated media, logs, and state are deliberately excluded
@@ -107,12 +155,16 @@ with:
 dwell config show
 ```
 
-The shared cache environment is:
+For child processes, Dwell resolves the shared cache environment internally as:
 
-```bash
-export HF_HOME="$HOME/.dwell/models/huggingface"
-export HF_HUB_CACHE="$HF_HOME/hub"
+```text
+HF_HOME=$HOME/.dwell/models/huggingface
+HF_HUB_CACHE=$HOME/.dwell/models/huggingface/hub
+HF_XET_CACHE=$HOME/.dwell/models/huggingface/xet
 ```
+
+These variables do not need to be exported in `.zshrc`. If they are unset, `dwell doctor` reports
+the Dwell-managed values as healthy; an explicitly conflicting value produces a warning.
 
 ## CLI
 
@@ -125,6 +177,10 @@ dwell restart
 dwell status
 dwell logs
 dwell logs --follow
+dwell setup
+dwell setup --check
+dwell setup --repair
+dwell setup --upgrade
 dwell doctor
 ```
 
@@ -156,17 +212,20 @@ dwell outputs list
 A safe first session is:
 
 ```bash
+dwell setup
+dwell setup --check
 dwell doctor
+dwell models list
+dwell models install ltx-2.5-bf16 --dry-run
 dwell start
 dwell status
-dwell models list
-dwell models install ltx-2.5-q8 --dry-run
 dwell stop
 ```
 
 `--dry-run` does not contact Hugging Face. A real install displays the source and approximate size,
-asks for confirmation for large downloads, uses the shared cache, resumes supported partial
-downloads, and verifies required files before considering the model installed.
+available disk and unified memory, license and acceptable-use links, and the exact required files.
+It asks for confirmation separately from runtime setup, uses the shared cache, resumes supported
+partial downloads, and verifies required files before considering the model installed.
 
 ## Models and runtimes are separate
 
@@ -183,10 +242,10 @@ The registry distinguishes `registered`, `available`, `installed`, and `loaded`.
 states are `not_installed`, `installed`, `loading`, `loaded`, `unloading`, and `error`.
 
 The bundled registry records the locally established `mlx-community/ltx-2.5-mlx` bf16 repository.
-It also records `ltx-2.5-q8` as an unconfigured profile because the repository metadata explicitly
-says that no quantized sibling is published. Dwell will not invent a source or silently substitute
-a different model. Set a verified repository in `~/.dwell/config/models.json` before attempting a
-real q8 installation.
+It also records `ltx-2.5-q8` as an unconfigured profile: Dwell has not verified a compatible q8
+repository, immutable revision, required-file set, and runtime behavior as one installable unit.
+Dwell will not invent or automatically enable a source. Set and test an explicit registry override
+in `~/.dwell/config/models.json` before attempting a real q8 installation.
 
 ## Local API
 
@@ -275,3 +334,18 @@ HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 UV_OFFLINE=1 uv run ruff check .
 Tests cover configuration, registry state, CLI parsing, API startup, errors, SQLite jobs, dry-run
 installation, and process management without model weights. Do not run a real
 `dwell models install` or LTX generation as part of routine tests.
+
+## Maintainer release
+
+Releases never run automatically on a commit or tag push. In GitHub Actions, open the **Release**
+workflow, choose **Run workflow** from `main`, enter the version already recorded in
+`pyproject.toml`, and select **publish**. Leaving **publish** unselected performs the complete
+project, package, and Homebrew validation without changing the remote repository.
+
+A publishing run validates the immutable `v<version>` tag and the matching
+`Formula/dwell.rb` update, pushes that tag and Formula commit atomically, and then creates the
+GitHub Release. A concurrent change to `main` therefore leaves neither Git ref partially
+published. Normal CI continues to validate development commits and pull requests, but it does not
+publish them. If GitHub Release creation is interrupted after the refs land, run the same version
+again from the new `main`; the workflow verifies the existing refs and resumes the incomplete
+release.

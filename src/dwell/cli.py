@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import os
+import shutil
 import time
 import urllib.error
 from collections.abc import Callable
@@ -178,6 +179,29 @@ def _model_disk_impact(cache_path: str | None) -> str:
     return f"up to {total / (1024**3):.2f} GB in the shared repository cache"
 
 
+def _free_disk_gib(path: Path) -> float | None:
+    """Return free space without creating the target directory."""
+
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    try:
+        return shutil.disk_usage(candidate).free / (1024**3)
+    except OSError:
+        return None
+
+
+def _physical_memory_gib() -> float | None:
+    try:
+        pages = int(os.sysconf("SC_PHYS_PAGES"))
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+    except (OSError, TypeError, ValueError):
+        return None
+    if pages <= 0 or page_size <= 0:
+        return None
+    return pages * page_size / (1024**3)
+
+
 @app.command()
 @_handled
 def start() -> None:
@@ -298,6 +322,50 @@ def doctor() -> None:
         raise typer.Exit(code=1)
 
 
+@app.command()
+@_handled
+def setup(
+    check: Annotated[
+        bool,
+        typer.Option("--check", help="Inspect setup without network or file changes."),
+    ] = False,
+    repair: Annotated[
+        bool,
+        typer.Option("--repair", help="Rebuild a broken venv at the pinned runtime commit."),
+    ] = False,
+    upgrade: Annotated[
+        bool,
+        typer.Option("--upgrade", help="Move a clean runtime to the current manifest commit."),
+    ] = False,
+) -> None:
+    """Prepare or verify the per-user LTX runtime without downloading models."""
+
+    from dwell.setup import SetupManager, SetupMode
+
+    if sum((check, repair, upgrade)) > 1:
+        raise DwellError("invalid_request", "Use only one of --check, --repair, or --upgrade.")
+    mode = (
+        SetupMode.CHECK
+        if check
+        else SetupMode.REPAIR
+        if repair
+        else SetupMode.UPGRADE
+        if upgrade
+        else SetupMode.INSTALL
+    )
+    report = SetupManager(_config()).run(mode)
+    for message in report.messages:
+        typer.echo(message)
+    if report.doctor_checks:
+        typer.echo("Doctor:")
+        for doctor_check in report.doctor_checks:
+            typer.echo(f"{doctor_check.marker} {doctor_check.name}: {doctor_check.detail}")
+    if not report.healthy:
+        typer.echo("✗ Setup check failed", err=True)
+        raise typer.Exit(code=1)
+    typer.echo("✓ Setup is healthy")
+
+
 def _models_list() -> None:
     config = _config()
     manager = _model_manager(config)
@@ -361,6 +429,8 @@ def models_info(model_id: str) -> None:
             if definition.weights.estimated_size_gb is not None
             else "unknown"
         ),
+        "license": definition.weights.license_url or "not configured",
+        "acceptable_use": definition.weights.acceptable_use_url or "not configured",
         "memory_profile": definition.profile.memory or "unknown",
         "runtime_requirements": ", ".join(definition.runtime_requirements) or "none",
         "persistent_loading": str(definition.capabilities.persistent_loading).lower(),
@@ -406,6 +476,45 @@ def models_install(
     notes = payload.get("notes")
     if notes:
         typer.echo(f"Note: {notes}")
+    license_url = payload.get("license_url")
+    acceptable_use_url = payload.get("acceptable_use_url")
+    if license_url:
+        typer.echo(f"License: {license_url}")
+    if acceptable_use_url:
+        typer.echo(f"Acceptable use: {acceptable_use_url}")
+    if isinstance(size, int | float):
+        required_gib = float(size) * 1_000_000_000 / (1024**3)
+        free_gib = _free_disk_gib(config.models_dir)
+        if free_gib is None:
+            typer.echo(
+                f"! Disk: could not determine free space; about {required_gib:.1f} GiB needed"
+            )
+        elif free_gib < required_gib:
+            typer.echo(
+                f"! Disk warning: {free_gib:.1f} GiB free; about {required_gib:.1f} GiB needed"
+            )
+        else:
+            typer.echo(f"Disk: {free_gib:.1f} GiB free; about {required_gib:.1f} GiB needed")
+    minimum_memory = payload.get("minimum_memory_gb")
+    memory_notes = payload.get("memory_notes")
+    if isinstance(minimum_memory, int | float):
+        memory_gib = _physical_memory_gib()
+        if memory_gib is None:
+            typer.echo(
+                "! Memory: could not determine unified memory; "
+                f"at least {minimum_memory:g} GB advised"
+            )
+        elif memory_gib < minimum_memory:
+            typer.echo(
+                f"! Memory warning: {memory_gib:.1f} GiB detected; "
+                f"at least {minimum_memory:g} GB advised"
+            )
+        else:
+            typer.echo(
+                f"Memory: {memory_gib:.1f} GiB detected; at least {minimum_memory:g} GB advised"
+            )
+    if memory_notes:
+        typer.echo(f"Memory note: {memory_notes}")
     typer.echo(f"Downloadable: {'yes' if payload.get('downloadable') else 'no'}")
     required = payload.get("required_files") or ()
     if required:

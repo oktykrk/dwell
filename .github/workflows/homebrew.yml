@@ -1,0 +1,186 @@
+name: Homebrew
+
+on:
+  pull_request:
+    paths:
+      - "Formula/**"
+      - ".github/workflows/homebrew.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "Formula/**"
+      - ".github/workflows/homebrew.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: homebrew-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  style-and-audit:
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify Apple Silicon Homebrew
+        run: |
+          test "$(uname -m)" = "arm64"
+          test "$(brew --prefix)" = "/opt/homebrew"
+
+      - name: Check formula style
+        run: brew style Formula/dwell.rb
+
+      - name: Tap checked-out repository
+        run: brew tap oktykrk/dwell "$GITHUB_WORKSPACE"
+
+      - name: Audit formula
+        run: brew audit --strict oktykrk/dwell/dwell
+
+  install-and-test:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    needs: style-and-audit
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Verify clean Apple Silicon prefix
+        run: |
+          test "$(uname -m)" = "arm64"
+          test "$(brew --prefix)" = "/opt/homebrew"
+          test ! -e "$(brew --cellar)/dwell"
+
+      - name: Resolve formula source
+        id: formula-source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          formula_tag=$(sed -n 's/^      tag: *"\([^"]*\)",$/\1/p' Formula/dwell.rb)
+          formula_revision=$(sed -n \
+            's/^      revision: *"\([0-9a-f]*\)"$/\1/p' Formula/dwell.rb)
+          test -n "$formula_tag"
+          test "${#formula_revision}" = "40"
+
+          if test "$GITHUB_EVENT_NAME" = "pull_request"; then
+            use_local="true"
+          else
+            remote_refs=$(git ls-remote --tags origin \
+              "refs/tags/$formula_tag" "refs/tags/$formula_tag^{}")
+            remote_tag=$(printf '%s\n' "$remote_refs" \
+              | awk -v ref="refs/tags/$formula_tag" '$2 == ref { print $1 }')
+            remote_revision=$(printf '%s\n' "$remote_refs" \
+              | awk -v ref="refs/tags/$formula_tag^{}" '$2 == ref { print $1 }')
+
+            if test -z "$remote_tag"; then
+              test "$GITHUB_EVENT_NAME" = "push" || {
+                echo "Remote release tag $formula_tag does not exist." >&2
+                exit 1
+              }
+              use_local="true"
+            else
+              test -n "$remote_revision" || {
+                echo "Remote release tag $formula_tag is not annotated." >&2
+                exit 1
+              }
+              test "$remote_revision" = "$formula_revision" || {
+                echo "Formula revision does not match remote tag $formula_tag." >&2
+                exit 1
+              }
+              use_local="false"
+            fi
+          fi
+
+          echo "local=$use_local" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare local CI source
+        if: steps.formula-source.outputs.local == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          project_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml | head -n 1)
+          test -n "$project_version"
+          source_tag="v$project_version"
+          source_sha=$(git rev-parse HEAD)
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --force --annotate "$source_tag" "$source_sha" \
+            --message "Homebrew CI $source_tag"
+
+          SOURCE_TAG="$source_tag" SOURCE_SHA="$source_sha" python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          formula = Path("Formula/dwell.rb")
+          content = formula.read_text(encoding="utf-8")
+          pattern = re.compile(
+              r'(?m)^(  url "ssh://git@github\.com/oktykrk/dwell\.git",\n'
+              r'      tag:\s+)"[^"]+"(,\n'
+              r'      revision:\s+)"[0-9a-f]{40}"$'
+          )
+          tag = os.environ["SOURCE_TAG"]
+          revision = os.environ["SOURCE_SHA"]
+          updated, replacements = pattern.subn(
+              lambda match: (
+                  f'{match.group(1)}"{tag}"{match.group(2)}"{revision}"'
+              ),
+              content,
+          )
+          if replacements != 1:
+              raise SystemExit(
+                  f"expected one Dwell formula source block, found {replacements}"
+              )
+          formula.write_text(updated, encoding="utf-8")
+          PY
+
+          git diff --check
+          git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
+          git switch --create homebrew-ci
+          git add Formula/dwell.rb
+          test "$(git diff --cached --name-only)" = "Formula/dwell.rb"
+          git commit -m "Prepare Homebrew formula for PR validation"
+          test "$(git rev-parse HEAD^)" = "$source_sha"
+
+          # The tap clone sees local commit B, while the Formula source resolves local tag A.
+          git config --global --add \
+            url."file://${GITHUB_WORKSPACE}/".insteadOf \
+            "ssh://git@github.com/oktykrk/dwell.git"
+
+      - name: Authenticate private source fetches
+        if: steps.formula-source.outputs.local != 'true'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          git config --global --add url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "git@github.com:"
+          git config --global --add url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "ssh://git@github.com/"
+
+      - name: Tap checked-out repository
+        run: brew tap oktykrk/dwell "$GITHUB_WORKSPACE"
+
+      - name: Build from source
+        run: brew install --build-from-source oktykrk/dwell/dwell
+
+      - name: Run formula test
+        run: brew test oktykrk/dwell/dwell
+
+      - name: Smoke test linked CLI
+        run: |
+          smoke_home="$RUNNER_TEMP/dwell-home"
+          DWELL_HOME="$smoke_home" dwell --version
+          DWELL_HOME="$smoke_home" dwell config show | grep -F "$smoke_home"
+          DWELL_HOME="$smoke_home" dwell models list | grep -F "ltx-2.5-bf16"

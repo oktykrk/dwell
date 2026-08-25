@@ -95,6 +95,10 @@ class DwellConfig(BaseModel):
         return self.hf_home / "hub"
 
     @property
+    def hf_xet_cache(self) -> Path:
+        return self.hf_home / "xet"
+
+    @property
     def registry_file(self) -> Path:
         return self.config_dir / "models.json"
 
@@ -123,6 +127,14 @@ class DwellConfig(BaseModel):
         return self.state_dir / "model-cache.lock"
 
     @property
+    def setup_lock_file(self) -> Path:
+        return self.state_dir / "setup.lock"
+
+    @property
+    def setup_state_file(self) -> Path:
+        return self.state_dir / "setup.json"
+
+    @property
     def jobs_db(self) -> Path:
         return self.state_dir / "jobs.sqlite"
 
@@ -135,6 +147,7 @@ class DwellConfig(BaseModel):
             self.models_dir,
             self.hf_home,
             self.hf_hub_cache,
+            self.hf_xet_cache,
             self.runtimes_dir,
             self.services_dir / "api",
             self.outputs_dir / "video",
@@ -154,6 +167,13 @@ class DwellConfig(BaseModel):
         """Environment used for inference and diagnostics; always local-only."""
 
         result = dict(os.environ if base is None else base)
+        for name in tuple(result):
+            if name.startswith("UV_") or name in {
+                "PYTHONHOME",
+                "PYTHONPATH",
+                "VIRTUAL_ENV",
+            }:
+                result.pop(name)
         result.update(
             {
                 "DWELL_HOME": str(self.home),
@@ -161,7 +181,9 @@ class DwellConfig(BaseModel):
                 "DWELL_PORT": str(self.port),
                 "HF_HOME": str(self.hf_home),
                 "HF_HUB_CACHE": str(self.hf_hub_cache),
+                "HF_XET_CACHE": str(self.hf_xet_cache),
                 "HF_HUB_OFFLINE": "1",
+                "PYTHONDONTWRITEBYTECODE": "1",
                 "TRANSFORMERS_OFFLINE": "1",
                 "UV_OFFLINE": "1",
                 "UV_NO_SYNC": "1",
@@ -182,4 +204,5 @@ class DwellConfig(BaseModel):
             "state_dir": str(self.state_dir),
             "HF_HOME": str(self.hf_home),
             "HF_HUB_CACHE": str(self.hf_hub_cache),
+            "HF_XET_CACHE": str(self.hf_xet_cache),
         }

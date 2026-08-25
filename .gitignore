@@ -3,6 +3,7 @@
 .pytest_cache/
 .ruff_cache/
 __pycache__/
+/.context/
 *.py[cod]
 *.egg-info/
 build/

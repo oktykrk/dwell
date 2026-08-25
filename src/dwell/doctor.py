@@ -68,17 +68,17 @@ def _tool_check(name: str, version_args: list[str]) -> DoctorCheck:
     result = _run([executable, *version_args])
     version = _first_line(result.stdout or result.stderr)
     if result.returncode:
-        return DoctorCheck(name, CheckLevel.WARNING, version or f"exit {result.returncode}")
+        return DoctorCheck(name, CheckLevel.ERROR, version or f"exit {result.returncode}")
     return DoctorCheck(name, CheckLevel.OK, version or executable)
 
 
-def _python_for_mlx(config: DwellConfig) -> Path:
+def _python_for_mlx(config: DwellConfig, *, runtime_trusted: bool) -> Path:
     runtime_python = config.runtimes_dir / "ltx-2-mlx" / ".venv" / "bin" / "python"
-    return runtime_python if runtime_python.is_file() else Path(sys.executable)
+    return runtime_python if runtime_trusted and runtime_python.is_file() else Path(sys.executable)
 
 
-def _mlx_checks(config: DwellConfig) -> list[DoctorCheck]:
-    python = _python_for_mlx(config)
+def _mlx_checks(config: DwellConfig, *, runtime_trusted: bool = False) -> list[DoctorCheck]:
+    python = _python_for_mlx(config, runtime_trusted=runtime_trusted)
     script = (
         "import importlib.metadata; import mlx.core as mx; "
         "print(importlib.metadata.version('mlx')); "
@@ -122,33 +122,78 @@ def _port_check(config: DwellConfig) -> DoctorCheck:
     )
 
 
-def _runtime_checks(config: DwellConfig) -> list[DoctorCheck]:
+def _runtime_audit(config: DwellConfig) -> tuple[list[DoctorCheck], bool]:
     runtime = config.runtimes_dir / "ltx-2-mlx"
+    if runtime.is_symlink():
+        return [DoctorCheck("LTX runtime", CheckLevel.ERROR, "runtime path is a symlink")], False
     if not (runtime / ".git").exists():
-        return [DoctorCheck("LTX runtime", CheckLevel.WARNING, f"missing: {runtime}")]
+        return [DoctorCheck("LTX runtime", CheckLevel.WARNING, f"missing: {runtime}")], False
 
-    branch = _run(["git", "-C", str(runtime), "branch", "--show-current"])
-    branch_name = branch.stdout.strip()
-    branch_level = CheckLevel.OK if branch_name == "ltx-2.5" else CheckLevel.WARNING
+    from dwell.setup import (
+        _read_runtime_identity,
+        _runtime_worktree_is_dirty,
+        _venv_provenance_is_valid,
+        load_runtime_manifest,
+    )
+
+    try:
+        spec = next(item for item in load_runtime_manifest() if item.id == "ltx-2-mlx")
+    except Exception as exc:
+        return [DoctorCheck("LTX runtime manifest", CheckLevel.ERROR, str(exc))], False
+    git = shutil.which("git") or "git"
+    remote, commit = _read_runtime_identity(runtime)
+    remote_ok = remote is not None and remote.removesuffix("/") == (
+        spec.repository.removesuffix("/")
+    )
+    commit_ok = commit == spec.commit
+    dirty = commit is None or _runtime_worktree_is_dirty(
+        runtime, expected_commit=commit, executable=git, runner=_run
+    )
     results = [
         DoctorCheck("LTX runtime", CheckLevel.OK, str(runtime)),
-        DoctorCheck("LTX branch", branch_level, branch_name or "unknown"),
+        DoctorCheck(
+            "LTX remote",
+            CheckLevel.OK if remote_ok else CheckLevel.ERROR,
+            remote or "unreadable",
+        ),
+        DoctorCheck(
+            "LTX commit",
+            CheckLevel.OK if commit_ok else CheckLevel.ERROR,
+            commit or "unreadable",
+        ),
+        DoctorCheck(
+            "LTX working tree",
+            CheckLevel.WARNING if dirty else CheckLevel.OK,
+            "local changes present" if dirty else "clean",
+        ),
     ]
 
-    uv = shutil.which("uv")
-    if uv is None:
-        results.append(DoctorCheck("LTX CLI", CheckLevel.ERROR, "uv not found"))
-        return results
+    source_trusted = remote_ok and commit_ok and not dirty
+    if not source_trusted:
+        level = CheckLevel.ERROR if not remote_ok or not commit_ok else CheckLevel.WARNING
+        results.append(
+            DoctorCheck(
+                "LTX CLI",
+                level,
+                "not executed because the runtime source is not the pinned, clean checkout",
+            )
+        )
+        return results, False
+
+    if not _venv_provenance_is_valid(runtime, spec):
+        results.append(
+            DoctorCheck(
+                "LTX CLI",
+                CheckLevel.ERROR,
+                "runtime venv provenance is missing or stale; run dwell setup --repair",
+            )
+        )
+        return results, False
+
+    cli = runtime / ".venv" / "bin" / "ltx-2-mlx"
     help_result = _run(
         [
-            uv,
-            "run",
-            "--project",
-            str(runtime),
-            "--offline",
-            "--no-sync",
-            "--no-python-downloads",
-            "ltx-2-mlx",
+            str(cli),
             "generate",
             "--help",
         ],
@@ -161,7 +206,12 @@ def _runtime_checks(config: DwellConfig) -> list[DoctorCheck]:
         results.append(DoctorCheck("LTX CLI", CheckLevel.ERROR, detail))
     else:
         results.append(DoctorCheck("LTX CLI", CheckLevel.OK, "offline help check passed"))
-    return results
+    return results, True
+
+
+def _runtime_checks(config: DwellConfig) -> list[DoctorCheck]:
+    checks, _trusted = _runtime_audit(config)
+    return checks
 
 
 def _environment_checks(config: DwellConfig) -> list[DoctorCheck]:
@@ -169,6 +219,7 @@ def _environment_checks(config: DwellConfig) -> list[DoctorCheck]:
     expected = {
         "HF_HOME": str(config.hf_home),
         "HF_HUB_CACHE": str(config.hf_hub_cache),
+        "HF_XET_CACHE": str(config.hf_xet_cache),
     }
     for name, desired in expected.items():
         actual = os.environ.get(name)
@@ -180,7 +231,11 @@ def _environment_checks(config: DwellConfig) -> list[DoctorCheck]:
             )
         else:
             results.append(
-                DoctorCheck(name, CheckLevel.WARNING, f"unset in this shell; resolved={desired}")
+                DoctorCheck(
+                    name,
+                    CheckLevel.OK,
+                    f"not set in this shell; Dwell injects {desired} into child processes",
+                )
             )
     return results
 
@@ -215,6 +270,7 @@ def _registry_checks(config: DwellConfig) -> list[DoctorCheck]:
 def run_doctor(config: DwellConfig | None = None) -> list[DoctorCheck]:
     config = config or DwellConfig.from_env()
     checks: list[DoctorCheck] = []
+    runtime_checks, runtime_trusted = _runtime_audit(config)
 
     system = platform.system()
     machine = platform.machine()
@@ -231,13 +287,14 @@ def run_doctor(config: DwellConfig | None = None) -> list[DoctorCheck]:
             _tool_check("uv", ["--version"]),
             _tool_check("git", ["--version"]),
             _tool_check("ffmpeg", ["-version"]),
+            _tool_check("ffprobe", ["-version"]),
         )
     )
-    checks.extend(_mlx_checks(config))
+    checks.extend(_mlx_checks(config, runtime_trusted=runtime_trusted))
     checks.extend(_environment_checks(config))
     checks.append(_directory_check(config))
     checks.append(_port_check(config))
-    checks.extend(_runtime_checks(config))
+    checks.extend(runtime_checks)
     checks.extend(_registry_checks(config))
     return checks
 
