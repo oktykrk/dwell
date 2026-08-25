@@ -1,3 +1,5 @@
+require_relative "lib/github_release_download_strategy"
+
 class Dwell < Formula
   include Language::Python::Virtualenv
 
