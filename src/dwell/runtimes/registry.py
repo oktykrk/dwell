@@ -38,7 +38,10 @@ class RuntimeRegistry:
             try:
                 return (
                     metadata.version("mlx-lm") == _MLX_LM_VERSION
-                    and util.find_spec("mlx_lm.server") is not None
+                    # Looking up a submodule imports its parent package. For
+                    # mlx-lm that can initialize MLX/Metal and make a simple
+                    # status request exceed its timeout on a cold process.
+                    and util.find_spec("mlx_lm") is not None
                 )
             except (ImportError, ValueError, metadata.PackageNotFoundError):
                 return False

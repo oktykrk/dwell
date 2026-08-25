@@ -9,6 +9,7 @@ from dwell.config import DwellConfig
 from dwell.domain import ModelDefinition, RuntimeCapabilities
 from dwell.errors import DwellError
 from dwell.registry import ModelRegistry
+from dwell.runtimes import registry as registry_module
 from dwell.runtimes.base import ModelRuntime, RuntimeStatus, TextStream
 from dwell.runtimes.registry import RuntimeRegistry
 
@@ -41,6 +42,30 @@ class FakeResidentRuntime(ModelRuntime):
     async def status(self) -> RuntimeStatus:
         loaded = (self.model_id,) if self.model_id else ()
         return RuntimeStatus(runtime_id=self.runtime_id, available=True, loaded_models=loaded)
+
+
+def test_mlx_lm_availability_uses_import_free_package_lookup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    looked_up: list[str] = []
+
+    monkeypatch.setattr(registry_module.platform, "system", lambda: "Darwin")
+    monkeypatch.setattr(registry_module.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(registry_module.metadata, "version", lambda _name: "0.31.3")
+
+    def find_spec(name: str) -> object:
+        looked_up.append(name)
+        if name == "mlx_lm.server":
+            raise AssertionError("submodule lookup would import mlx_lm")
+        return object()
+
+    monkeypatch.setattr(registry_module.util, "find_spec", find_spec)
+    config = DwellConfig(home=tmp_path)
+    registry = RuntimeRegistry(config, ModelRegistry(config, definitions=[]))
+
+    assert registry.is_available("mlx-lm") is True
+    assert looked_up == ["mlx_lm"]
 
 
 @pytest.mark.asyncio
