@@ -1,0 +1,23 @@
+.DS_Store
+.venv/
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+htmlcov/
+
+# Dwell operational data must never enter source control.
+/models/
+/outputs/
+/tmp/
+/logs/
+/state/
+/runtimes/
+
+# Local configuration and secrets.
+.env
+/config/local*.json

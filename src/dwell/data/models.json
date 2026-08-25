@@ -1,0 +1,86 @@
+{
+  "schema_version": 1,
+  "models": [
+    {
+      "id": "ltx-2.5-bf16",
+      "family": "ltx",
+      "version": "2.5",
+      "modality": "video",
+      "runtime": "ltx-2-mlx",
+      "weights": {
+        "provider": "huggingface",
+        "repository": "mlx-community/ltx-2.5-mlx",
+        "revision": "851cff741ecbd650b7d417af74c3e7b73f76dd64",
+        "required_files": [
+          "config.json",
+          "embedded_config.json",
+          "transformer-distilled.safetensors",
+          "connector.safetensors",
+          "vae_encoder.safetensors",
+          "vae_decoder.safetensors",
+          "audio_vae.safetensors",
+          "vocoder.safetensors",
+          "spatial_upscaler_x2_v1_1.safetensors",
+          "spatial_upscaler_x2_v1_1_config.json",
+          "gemma4-12b-ltx-v1/config.json",
+          "gemma4-12b-ltx-v1/tokenizer.json",
+          "gemma4-12b-ltx-v1/tokenizer_config.json",
+          "gemma4-12b-ltx-v1/*.safetensors"
+        ],
+        "estimated_size_gb": null,
+        "notes": "Pinned, unquantized bf16 MLX conversion. Completeness is verified for the distilled Dwell adapter, and inference only resolves this exact local snapshot."
+      },
+      "profile": {
+        "quantization": "bf16",
+        "disk": null,
+        "memory": "Use the runtime's low-RAM streaming mode on 48 GB systems."
+      },
+      "runtime_requirements": [
+        "macOS on Apple Silicon",
+        "MLX/Metal",
+        "uv",
+        "ffmpeg"
+      ],
+      "capabilities": {
+        "persistent_loading": false,
+        "progress_reporting": false,
+        "cancellation": true,
+        "streaming": false,
+        "structured_output": false
+      }
+    },
+    {
+      "id": "ltx-2.5-q8",
+      "family": "ltx",
+      "version": "2.5",
+      "modality": "video",
+      "runtime": "ltx-2-mlx",
+      "weights": {
+        "provider": "unconfigured",
+        "repository": null,
+        "revision": null,
+        "required_files": [],
+        "estimated_size_gb": null,
+        "notes": "Registered placeholder only. The local LTX-2.5 model README explicitly states that no quantized sibling is published; configure a verified source before installation."
+      },
+      "profile": {
+        "quantization": "q8",
+        "disk": null,
+        "memory": null
+      },
+      "runtime_requirements": [
+        "macOS on Apple Silicon",
+        "MLX/Metal",
+        "uv",
+        "ffmpeg"
+      ],
+      "capabilities": {
+        "persistent_loading": false,
+        "progress_reporting": false,
+        "cancellation": true,
+        "streaming": false,
+        "structured_output": false
+      }
+    }
+  ]
+}
