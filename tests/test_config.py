@@ -6,6 +6,13 @@ from pydantic import ValidationError
 from dwell.config import DwellConfig
 
 
+def test_default_home_is_hidden(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+    assert DwellConfig().home == tmp_path / ".dwell"
+    assert DwellConfig.from_env({}).home == tmp_path / ".dwell"
+
+
 def test_defaults_derive_from_home(tmp_path: Path) -> None:
     config = DwellConfig(home=tmp_path)
 
