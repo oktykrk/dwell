@@ -7,7 +7,6 @@ on:
       - ".github/workflows/homebrew.yml"
       - "pyproject.toml"
       - "uv.lock"
-      - "src/dwell/**"
   workflow_dispatch:
 
 permissions:
