@@ -73,6 +73,10 @@ def test_health_status_and_models_are_truthful_and_offline(tmp_path: Path) -> No
         assert models.json()["data"][0]["id"] == "local-video"
         assert models.json()["data"][0]["installed"] is False
 
+        openai_models = client.get("/openai/v1/models")
+        assert openai_models.status_code == 200
+        assert openai_models.json() == {"object": "list", "data": []}
+
     log = (tmp_path / "logs" / "dwell.log").read_text(encoding="utf-8")
     assert "Dwell API starting" in log
     assert "Dwell API shutting down" in log

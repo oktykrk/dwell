@@ -29,7 +29,7 @@ Dwell — 127.0.0.1:8188
         └── modality-specific engine interfaces
                  │
                  ├── video: ltx-2-mlx subprocess adapter
-                 ├── text: future adapter
+                 ├── text: daemon-owned mlx-lm sidecar adapter
                  ├── image: future adapter
                  ├── audio: future adapter
                  └── embeddings: future adapter
@@ -47,13 +47,14 @@ one worker by default because CPU and GPU share unified memory.
 The current LTX adapter is on-demand only. It does **not** keep a model resident between requests,
 so `models load` reports readiness rather than pretending the model is loaded. `models unload`
 truthfully reports that there is no persistent runtime state to release. The runtime capability
-interface allows a future in-process or resident engine to implement real load/unload behavior.
+interface also supports the resident MLX-LM text engine. Dwell starts that sidecar lazily on the
+first chat request, keeps the model available for later requests, and owns its shutdown.
 
 ## Installation with Homebrew
 
 The repository is private, so first make sure your GitHub account has access and your SSH key can
-authenticate to GitHub. Then install Dwell on an Apple Silicon Mac without cloning the repository
-manually:
+authenticate to GitHub. Then install Dwell on an Apple Silicon Mac running macOS 14 Sonoma or
+newer, without cloning the repository manually:
 
 ```bash
 brew tap oktykrk/dwell git@github.com:oktykrk/dwell.git
@@ -64,10 +65,11 @@ dwell start
 dwell status
 ```
 
-`brew install` installs the Dwell CLI and its system dependencies in Homebrew's managed prefix.
-`dwell setup` prepares the per-user runtime under `~/.dwell`; it does not download model weights,
-start the server, or edit `.zshrc` or any other shell configuration. Model weights are downloaded
-only by the explicit `dwell models install …` command.
+`brew install` installs the Dwell CLI, the pinned MLX-LM text runtime, and its system dependencies
+in Homebrew's managed prefix. `dwell setup` prepares the separate per-user LTX video runtime under
+`~/.dwell`; it does not download model weights, start the server, or edit `.zshrc` or any other
+shell configuration. Model weights are downloaded only by the explicit
+`dwell models install …` command.
 
 ### Updating a Homebrew installation
 
@@ -146,6 +148,7 @@ Defaults:
 DWELL_HOME=$HOME/.dwell
 DWELL_HOST=127.0.0.1
 DWELL_PORT=8188
+DWELL_MLX_LM_PORT=8189
 ```
 
 For safety, values other than `127.0.0.1` are rejected for `DWELL_HOST`. Resolved paths are shown
@@ -217,6 +220,7 @@ dwell setup --check
 dwell doctor
 dwell models list
 dwell models install ltx-2.5-bf16 --dry-run
+dwell models install qwen3-coder-30b-a3b-4bit --dry-run
 dwell start
 dwell status
 dwell stop
@@ -247,6 +251,11 @@ repository, immutable revision, required-file set, and runtime behavior as one i
 Dwell will not invent or automatically enable a source. Set and test an explicit registry override
 in `~/.dwell/config/models.json` before attempting a real q8 installation.
 
+The registry also pins `qwen3-coder-30b-a3b-4bit` to the verified
+`mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` snapshot. Install it explicitly with
+`dwell models install`; after that, the Dwell daemon can serve it through the pinned `mlx-lm`
+runtime and the OpenAI-compatible chat API.
+
 ## Local API
 
 The API listens only at `http://127.0.0.1:8188`.
@@ -255,10 +264,98 @@ The API listens only at `http://127.0.0.1:8188`.
 GET    /health
 GET    /v1/status
 GET    /v1/models
+POST   /v1/models/{model_id}/load
+DELETE /v1/models/{model_id}/load
+DELETE /v1/models
 POST   /v1/videos
 GET    /v1/jobs/{job_id}
 DELETE /v1/jobs/{job_id}
+GET    /openai/v1/models
+POST   /openai/v1/chat/completions
 ```
+
+### Local coding with Qwen and OpenCode
+
+Install the weights once, then start the Dwell daemon:
+
+```bash
+dwell models install qwen3-coder-30b-a3b-4bit --yes
+dwell start
+```
+
+No separate `mlx_lm.server` process or model-load command is required. The first chat request
+starts a daemon-owned MLX-LM sidecar lazily; `dwell stop` shuts it down. Non-streaming requests use
+the registered Dwell model ID:
+
+```bash
+curl -sS http://127.0.0.1:8188/openai/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{
+    "model": "qwen3-coder-30b-a3b-4bit",
+    "messages": [
+      {"role": "user", "content": "Write a Python binary-search function with tests."}
+    ],
+    "max_tokens": 512,
+    "temperature": 0,
+    "stream": false
+  }'
+```
+
+For an SSE stream, set `stream` to `true` and keep curl's output unbuffered:
+
+```bash
+curl -N -sS http://127.0.0.1:8188/openai/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -H 'accept: text/event-stream' \
+  -d '{
+    "model": "qwen3-coder-30b-a3b-4bit",
+    "messages": [
+      {"role": "user", "content": "Explain the failing test and propose a minimal patch."}
+    ],
+    "max_tokens": 512,
+    "temperature": 0,
+    "stream": true
+  }'
+```
+
+OpenCode can use the same endpoint as a global OpenAI-compatible provider. Create
+`~/.config/opencode/opencode.json`, or merge the `dwell` provider below into the existing file:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "dwell": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Dwell Local",
+      "options": {
+        "baseURL": "http://127.0.0.1:8188/openai/v1"
+      },
+      "models": {
+        "qwen3-coder-30b-a3b-4bit": {
+          "name": "Qwen3 Coder 30B A3B 4-bit",
+          "limit": {
+            "context": 32768,
+            "output": 8192
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+In Conductor, open **Settings → Harnesses → OpenCode**, make the provider/model visible, and
+select `dwell/qwen3-coder-30b-a3b-4bit` in a new OpenCode chat. Use a **local** Conductor workspace:
+a cloud workspace cannot reach the Mac's `127.0.0.1`. The model cache, daemon, fixed port, and Apple
+Silicon GPU are shared across local workspaces, so run one Dwell daemon and keep only one text
+generation active at a time.
+
+Inference is offline-only: startup and chat requests resolve the exact installed snapshot and
+never download weights. Only the explicit `dwell models install` command may contact Hugging Face.
+The current compatibility surface targets OpenCode through OpenAI Chat Completions. OpenAI
+Responses and Anthropic Messages are not implemented, so Codex and Claude Code cannot use this
+endpoint as their model provider; Cursor is not supported for this local-provider path either.
 
 Example video request:
 

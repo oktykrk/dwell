@@ -45,7 +45,11 @@ def test_bundled_registry_is_truthful_about_unconfigured_q8(tmp_path: Path) -> N
     registry = ModelRegistry.load(config)
     manager = ModelManager(config, registry=registry)
 
-    assert [model.id for model in registry.list()] == ["ltx-2.5-bf16", "ltx-2.5-q8"]
+    assert [model.id for model in registry.list()] == [
+        "ltx-2.5-bf16",
+        "ltx-2.5-q8",
+        "qwen3-coder-30b-a3b-4bit",
+    ]
     plan = manager.install_plan("ltx-2.5-q8")
     assert plan.downloadable is False
     assert plan.repository is None
@@ -70,6 +74,26 @@ def test_bundled_bf16_install_plan_has_verified_size_and_usage_terms(tmp_path: P
     )
     assert "transformer-distilled.safetensors" in plan.required_files
     assert "transformer-dev.safetensors" not in plan.required_files
+
+
+def test_bundled_qwen_coder_has_a_pinned_downloadable_manifest(tmp_path: Path) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    registry = ModelRegistry.load(config)
+    manager = ModelManager(config, registry=registry)
+
+    definition = registry.get("qwen3-coder-30b-a3b-4bit")
+    plan = manager.install_plan(definition.id)
+
+    assert definition.modality == Modality.TEXT
+    assert definition.runtime == "mlx-lm"
+    assert definition.weights.revision == "6e302ea604ad9ab206367e2c501d1571023e7b6d"
+    assert "model-*.safetensors" in definition.weights.required_files
+    assert plan.repository == "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"
+    assert plan.estimated_size_gb == 17.2
+    assert plan.license_url == "https://www.apache.org/licenses/LICENSE-2.0"
+    assert plan.downloadable is True
+    assert plan.already_installed is False
+    assert not config.home.exists(), "offline planning must not create operational state"
 
 
 def test_partial_and_zero_byte_files_are_never_installed(tmp_path: Path) -> None:

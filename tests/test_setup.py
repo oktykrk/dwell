@@ -165,6 +165,11 @@ def supported_host(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(dwell_setup_module.platform, "system", lambda: "Darwin")
     monkeypatch.setattr(dwell_setup_module.platform, "machine", lambda: "arm64")
     monkeypatch.setattr(
+        dwell_setup_module.platform,
+        "mac_ver",
+        lambda: ("14.7", ("", "", ""), ""),
+    )
+    monkeypatch.setattr(
         dwell_setup_module.shutil,
         "which",
         lambda name: _REAL_GIT if name == "git" else f"/test-tools/{name}",
@@ -363,6 +368,20 @@ def test_wrong_platform_and_missing_tool_fail_before_layout(
     assert not config.home.exists()
 
     monkeypatch.setattr(dwell_setup_module.platform, "machine", lambda: "arm64")
+    monkeypatch.setattr(
+        dwell_setup_module.platform,
+        "mac_ver",
+        lambda: ("13.7", ("", "", ""), ""),
+    )
+    with pytest.raises(DwellError, match="requires macOS 14 Sonoma"):
+        manager.run()
+    assert not config.home.exists()
+
+    monkeypatch.setattr(
+        dwell_setup_module.platform,
+        "mac_ver",
+        lambda: ("14.7", ("", "", ""), ""),
+    )
     monkeypatch.setattr(dwell_setup_module.shutil, "which", lambda _name: None)
     with pytest.raises(DwellError, match="Required setup tools are missing"):
         manager.run()

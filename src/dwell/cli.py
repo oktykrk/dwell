@@ -18,7 +18,7 @@ from pydantic import BaseModel, ValidationError
 from dwell import __version__
 from dwell.config import DwellConfig
 from dwell.doctor import has_errors, run_doctor
-from dwell.domain import JobRecord, JobStatus
+from dwell.domain import JobRecord, JobStatus, ModelView
 from dwell.errors import DwellError
 from dwell.process import (
     api_request,
@@ -438,6 +438,7 @@ def models_info(model_id: str) -> None:
         "cancellation": str(definition.capabilities.cancellation).lower(),
         "streaming": str(definition.capabilities.streaming).lower(),
         "structured_output": str(definition.capabilities.structured_output).lower(),
+        "tool_calling": str(definition.capabilities.tool_calling).lower(),
     }
     for name, value in values.items():
         typer.echo(f"{name}: {value}")
@@ -576,8 +577,20 @@ def models_load(model_id: str) -> None:
     config = _config()
     _enable_local_logging(config)
     manager = _model_manager(config)
-    view = asyncio.run(manager.load(model_id))
     definition = manager.registry.get(model_id)
+    if definition.capabilities.persistent_loading:
+        current = server_status(config)
+        if not current["running"] or current.get("api_status") is None:
+            raise DwellError(
+                "runtime_not_available",
+                "Start Dwell before loading a persistent model: dwell start",
+                status_code=503,
+            )
+        view = ModelView.model_validate(
+            api_request(config, f"/v1/models/{model_id}/load", method="POST", timeout=180)
+        )
+    else:
+        view = asyncio.run(manager.load(model_id))
     if view.loaded:
         typer.echo(f"✓ Model loaded: {model_id}")
     elif not definition.capabilities.persistent_loading:
@@ -604,11 +617,25 @@ def models_unload(
     _enable_local_logging(config)
     manager = _model_manager(config)
     if all_models:
-        asyncio.run(manager.unload_all())
+        current = server_status(config)
+        if current["running"] and current.get("api_status") is not None:
+            api_request(config, "/v1/models", method="DELETE", timeout=180)
+        else:
+            asyncio.run(manager.unload_all())
         typer.echo("No persistent models remain loaded.")
     else:
-        asyncio.run(manager.unload(model_id))
         definition = manager.registry.get(model_id)
+        if definition.capabilities.persistent_loading:
+            current = server_status(config)
+            if not current["running"] or current.get("api_status") is None:
+                raise DwellError(
+                    "runtime_not_available",
+                    "Dwell is not running; no daemon-owned model can be unloaded.",
+                    status_code=503,
+                )
+            api_request(config, f"/v1/models/{model_id}/load", method="DELETE", timeout=180)
+        else:
+            asyncio.run(manager.unload(model_id))
         if definition.capabilities.persistent_loading:
             typer.echo(f"Model '{model_id}' is not loaded.")
         else:

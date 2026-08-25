@@ -86,6 +86,52 @@
         "streaming": false,
         "structured_output": false
       }
+    },
+    {
+      "id": "qwen3-coder-30b-a3b-4bit",
+      "family": "qwen3-coder",
+      "version": "30B-A3B-Instruct",
+      "modality": "text",
+      "runtime": "mlx-lm",
+      "weights": {
+        "provider": "huggingface",
+        "repository": "mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit",
+        "revision": "6e302ea604ad9ab206367e2c501d1571023e7b6d",
+        "required_files": [
+          "config.json",
+          "generation_config.json",
+          "chat_template.jinja",
+          "added_tokens.json",
+          "merges.txt",
+          "special_tokens_map.json",
+          "tokenizer.json",
+          "tokenizer_config.json",
+          "vocab.json",
+          "model.safetensors.index.json",
+          "model-*.safetensors"
+        ],
+        "estimated_size_gb": 17.2,
+        "license_url": "https://www.apache.org/licenses/LICENSE-2.0",
+        "notes": "Pinned Apache-2.0 MLX 4-bit coding model with a complete tokenizer, index, and sharded-weight manifest. Dwell serves it locally through the pinned mlx-lm runtime after explicit installation."
+      },
+      "profile": {
+        "quantization": "4bit",
+        "disk": "Approximately 17.2 GB",
+        "memory": "Recommended for 48 GB unified-memory Macs; begin with a 32K context limit."
+      },
+      "runtime_requirements": [
+        "macOS 14 Sonoma or newer on Apple Silicon",
+        "MLX/Metal",
+        "mlx-lm"
+      ],
+      "capabilities": {
+        "persistent_loading": true,
+        "progress_reporting": false,
+        "cancellation": true,
+        "streaming": true,
+        "structured_output": false,
+        "tool_calling": true
+      }
     }
   ]
 }

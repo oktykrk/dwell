@@ -4,7 +4,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 class DwellConfig(BaseModel):
@@ -15,6 +15,7 @@ class DwellConfig(BaseModel):
     home: Path = Field(default_factory=lambda: Path.home() / ".dwell")
     host: str = "127.0.0.1"
     port: int = Field(default=8188, ge=1, le=65535)
+    mlx_lm_port: int = Field(default=8189, ge=1, le=65535)
 
     @field_validator("home", mode="before")
     @classmethod
@@ -37,18 +38,31 @@ class DwellConfig(BaseModel):
             raise ValueError("Dwell may only bind to 127.0.0.1")
         return value
 
+    @model_validator(mode="after")
+    def internal_port_must_be_distinct(self) -> DwellConfig:
+        if self.mlx_lm_port == self.port:
+            raise ValueError("DWELL_MLX_LM_PORT must differ from DWELL_PORT")
+        return self
+
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> DwellConfig:
         values = os.environ if env is None else env
+        port = int(values.get("DWELL_PORT", "8188"))
+        default_mlx_port = port + 1 if port < 65535 else port - 1
         return cls(
             home=values.get("DWELL_HOME", str(Path.home() / ".dwell")),
             host=values.get("DWELL_HOST", "127.0.0.1"),
-            port=int(values.get("DWELL_PORT", "8188")),
+            port=port,
+            mlx_lm_port=int(values.get("DWELL_MLX_LM_PORT", str(default_mlx_port))),
         )
 
     @property
     def api_url(self) -> str:
         return f"http://{self.host}:{self.port}"
+
+    @property
+    def mlx_lm_url(self) -> str:
+        return f"http://127.0.0.1:{self.mlx_lm_port}"
 
     @property
     def models_dir(self) -> Path:
@@ -123,6 +137,10 @@ class DwellConfig(BaseModel):
         return self.state_dir / "ltx-2-mlx.lock"
 
     @property
+    def mlx_lm_lock_file(self) -> Path:
+        return self.state_dir / "mlx-lm.lock"
+
+    @property
     def model_cache_lock_file(self) -> Path:
         return self.state_dir / "model-cache.lock"
 
@@ -179,6 +197,7 @@ class DwellConfig(BaseModel):
                 "DWELL_HOME": str(self.home),
                 "DWELL_HOST": self.host,
                 "DWELL_PORT": str(self.port),
+                "DWELL_MLX_LM_PORT": str(self.mlx_lm_port),
                 "HF_HOME": str(self.hf_home),
                 "HF_HUB_CACHE": str(self.hf_hub_cache),
                 "HF_XET_CACHE": str(self.hf_xet_cache),
@@ -197,6 +216,7 @@ class DwellConfig(BaseModel):
             "home": str(self.home),
             "api_host": self.host,
             "api_port": self.port,
+            "mlx_lm_port": self.mlx_lm_port,
             "models_dir": str(self.models_dir),
             "runtimes_dir": str(self.runtimes_dir),
             "outputs_dir": str(self.outputs_dir),

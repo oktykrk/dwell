@@ -55,6 +55,7 @@ class RuntimeCapabilities(BaseModel):
     cancellation: bool = True
     streaming: bool = False
     structured_output: bool = False
+    tool_calling: bool = False
 
 
 class WeightSource(BaseModel):

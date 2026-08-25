@@ -23,6 +23,9 @@ jobs:
       - name: Check out source
         uses: actions/checkout@v6
 
+      - name: Verify Apple Silicon runner
+        run: test "$(uname -m)" = "arm64"
+
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v9.0.0
         with:
@@ -61,3 +64,7 @@ jobs:
           DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" --version
           DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" config show | grep -F "$smoke_home"
           DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" models list | grep -F "ltx-2.5-bf16"
+          DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" models list \
+            | grep -F "qwen3-coder-30b-a3b-4bit"
+          "$smoke_venv/bin/python" -c \
+            "import importlib.metadata; import mlx_lm.server; assert importlib.metadata.version('mlx-lm') == '0.31.3'"

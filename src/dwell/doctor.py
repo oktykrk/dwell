@@ -100,6 +100,20 @@ def _mlx_checks(config: DwellConfig, *, runtime_trusted: bool = False) -> list[D
     ]
 
 
+def _mlx_lm_checks(config: DwellConfig) -> list[DoctorCheck]:
+    script = "import importlib.metadata; print(importlib.metadata.version('mlx-lm'))"
+    result = _run([sys.executable, "-c", script], env=config.subprocess_env(), timeout=15)
+    if result.returncode:
+        detail = _first_line(result.stderr) or "not importable"
+        return [DoctorCheck("MLX-LM runtime", CheckLevel.ERROR, detail)]
+    version = _first_line(result.stdout)
+    level = CheckLevel.OK if version == "0.31.3" else CheckLevel.ERROR
+    detail = f"{version} via {sys.executable}"
+    if level == CheckLevel.ERROR:
+        detail += "; Dwell expects 0.31.3"
+    return [DoctorCheck("MLX-LM runtime", level, detail)]
+
+
 def _directory_check(config: DwellConfig) -> DoctorCheck:
     try:
         config.ensure_layout()
@@ -275,7 +289,22 @@ def run_doctor(config: DwellConfig | None = None) -> list[DoctorCheck]:
     system = platform.system()
     machine = platform.machine()
     if system == "Darwin" and machine == "arm64":
-        checks.append(DoctorCheck("Platform", CheckLevel.OK, "macOS arm64"))
+        macos_version = platform.mac_ver()[0]
+        try:
+            supported_macos = int(macos_version.split(".", 1)[0]) >= 14
+        except (TypeError, ValueError):
+            supported_macos = False
+        checks.append(
+            DoctorCheck(
+                "Platform",
+                CheckLevel.OK if supported_macos else CheckLevel.ERROR,
+                f"macOS {macos_version} arm64"
+                if supported_macos
+                else (
+                    f"macOS {macos_version or 'unknown'} arm64; requires macOS 14 Sonoma or newer"
+                ),
+            )
+        )
     else:
         checks.append(DoctorCheck("Platform", CheckLevel.ERROR, f"{system} {machine}"))
 
@@ -291,6 +320,7 @@ def run_doctor(config: DwellConfig | None = None) -> list[DoctorCheck]:
         )
     )
     checks.extend(_mlx_checks(config, runtime_trusted=runtime_trusted))
+    checks.extend(_mlx_lm_checks(config))
     checks.extend(_environment_checks(config))
     checks.append(_directory_check(config))
     checks.append(_port_check(config))

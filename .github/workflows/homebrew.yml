@@ -5,6 +5,9 @@ on:
     paths:
       - "Formula/**"
       - ".github/workflows/homebrew.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "src/dwell/**"
   workflow_dispatch:
 
 permissions:
@@ -178,3 +181,6 @@ jobs:
           DWELL_HOME="$smoke_home" dwell --version
           DWELL_HOME="$smoke_home" dwell config show | grep -F "$smoke_home"
           DWELL_HOME="$smoke_home" dwell models list | grep -F "ltx-2.5-bf16"
+          DWELL_HOME="$smoke_home" dwell models list | grep -F "qwen3-coder-30b-a3b-4bit"
+          "$(brew --prefix dwell)/libexec/bin/python" -c \
+            "import importlib.metadata; import mlx_lm.server; assert importlib.metadata.version('mlx-lm') == '0.31.3'"
