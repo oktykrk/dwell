@@ -26,10 +26,21 @@ jobs:
       - name: Verify Apple Silicon runner
         run: test "$(uname -m)" = "arm64"
 
+      - name: Validate installer contract
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -x install.sh
+          /bin/sh -n install.sh
+          grep -F "requirements-macos-arm64-py311.txt" install.sh
+          grep -F "SHA256SUMS" install.sh
+
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v9.0.0
         with:
-          python-version: "3.11"
+          version: "0.11.32"
+          python-version: "3.11.15"
           enable-cache: true
 
       - name: Install locked development environment
@@ -58,7 +69,7 @@ jobs:
           test -n "$wheel"
           test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
 
-          uv venv "$smoke_venv" --python 3.11
+          uv venv "$smoke_venv" --python 3.11.15
           uv pip install --python "$smoke_venv/bin/python" "$wheel"
 
           DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" --version

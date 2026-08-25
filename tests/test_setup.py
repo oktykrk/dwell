@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
+import io
 import json
 import os
 import shutil
 import subprocess
+import tarfile
 from collections.abc import Callable
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from dwell import setup as dwell_setup_module
@@ -77,6 +82,79 @@ def _spec(repository: Path, commit: str) -> RuntimeSpec:
         branch="ltx-2.5",
         commit=commit,
         python="3.11",
+    )
+
+
+def _runtime_archive(
+    tmp_path: Path,
+    commit: str,
+    *,
+    runtime_text: str = "one\n",
+    unsafe_name: str | None = None,
+) -> Path:
+    archive = tmp_path / f"ltx-{commit[:12]}-{len(list(tmp_path.glob('ltx-*.tar.gz')))}.tar.gz"
+    root = f"ltx-2-mlx-{commit}"
+    with tarfile.open(archive, "w:gz") as bundle:
+        root_entry = tarfile.TarInfo(root)
+        root_entry.type = tarfile.DIRTYPE
+        root_entry.mode = 0o755
+        bundle.addfile(root_entry)
+        contents = {
+            ".gitignore": b".venv/\n",
+            "uv.lock": b"version = 1\n",
+            "runtime.txt": runtime_text.encode(),
+        }
+        if unsafe_name is not None:
+            contents = {unsafe_name: b"unsafe\n"}
+        for name, payload in contents.items():
+            entry = tarfile.TarInfo(f"{root}/{name}")
+            entry.mode = 0o644
+            entry.size = len(payload)
+            bundle.addfile(entry, io.BytesIO(payload))
+    return archive
+
+
+def _archive_spec(
+    archive: Path,
+    commit: str,
+    *,
+    repository: str = "https://github.com/xocialize/ltx-2-mlx.git",
+    sha256: str | None = None,
+) -> RuntimeSpec:
+    return RuntimeSpec(
+        id="ltx-2-mlx",
+        repository=repository,
+        branch="main",
+        archive_url=f"https://github.com/xocialize/ltx-2-mlx/archive/{commit}.tar.gz",
+        archive_sha256=sha256 or hashlib.sha256(archive.read_bytes()).hexdigest(),
+        commit=commit,
+        python="3.11",
+    )
+
+
+def _archive_manager(
+    config: DwellConfig,
+    spec: RuntimeSpec,
+    archive: Path,
+    runner: FakeRunner | None = None,
+) -> tuple[SetupManager, FakeRunner, list[str]]:
+    command_runner = runner or FakeRunner()
+    downloads: list[str] = []
+
+    def download(url: str, destination: Path, _expected_sha256: str) -> None:
+        downloads.append(url)
+        shutil.copyfile(archive, destination)
+
+    return (
+        SetupManager(
+            config,
+            runtime=spec,
+            runner=command_runner,
+            doctor_runner=_doctor_ok,
+            archive_downloader=download,
+        ),
+        command_runner,
+        downloads,
     )
 
 
@@ -198,8 +276,275 @@ def test_packaged_runtime_manifest_is_immutable() -> None:
 
     assert runtime.id == "ltx-2-mlx"
     assert runtime.branch == "main"
+    assert runtime.uses_archive is True
+    assert runtime.archive_url == (
+        "https://github.com/xocialize/ltx-2-mlx/archive/"
+        "8ebae0a7cb08312fbf884790b91b4d155e714cdc.tar.gz"
+    )
+    assert runtime.archive_sha256 == (
+        "3a537bec3b59146cb9e1c4fe81c8769bdcf7e790bd797bfd2d535c730bfea6b4"
+    )
     assert runtime.commit == "8ebae0a7cb08312fbf884790b91b4d155e714cdc"
     assert runtime.python == "3.11"
+
+
+def test_default_archive_downloader_streams_and_verifies_https(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = b"verified runtime archive"
+    expected_sha256 = hashlib.sha256(payload).hexdigest()
+    calls: list[tuple[str, str, dict[str, object]]] = []
+
+    class Response:
+        url = httpx.URL("https://codeload.github.com/example/runtime.tar.gz")
+        history = (SimpleNamespace(url=httpx.URL("https://github.com/example/archive")),)
+        headers = {"Content-Length": str(len(payload))}
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def iter_raw(*, chunk_size: int):
+            assert chunk_size == 1024 * 1024
+            yield payload[:7]
+            yield payload[7:]
+
+    @contextmanager
+    def fake_stream(method: str, url: str, **kwargs):
+        calls.append((method, url, kwargs))
+        yield Response()
+
+    monkeypatch.setattr(dwell_setup_module.httpx, "stream", fake_stream)
+    destination = tmp_path / "runtime.tar.gz"
+
+    dwell_setup_module._download_archive(
+        "https://github.com/example/archive",
+        destination,
+        expected_sha256,
+    )
+
+    assert destination.read_bytes() == payload
+    assert calls[0][0:2] == ("GET", "https://github.com/example/archive")
+    assert calls[0][2]["follow_redirects"] is True
+    assert calls[0][2]["headers"] == {
+        "Accept-Encoding": "identity",
+        "User-Agent": "dwell/0.1.0",
+    }
+
+
+def test_default_archive_downloader_removes_a_checksum_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Response:
+        url = httpx.URL("https://github.com/example/runtime.tar.gz")
+        history = ()
+        headers: dict[str, str] = {}
+
+        @staticmethod
+        def raise_for_status() -> None:
+            return None
+
+        @staticmethod
+        def iter_raw(*, chunk_size: int):
+            assert chunk_size == 1024 * 1024
+            yield b"wrong"
+
+    @contextmanager
+    def fake_stream(*_args, **_kwargs):
+        yield Response()
+
+    monkeypatch.setattr(dwell_setup_module.httpx, "stream", fake_stream)
+    destination = tmp_path / "runtime.tar.gz"
+
+    with pytest.raises(DwellError, match="checksum verification failed"):
+        dwell_setup_module._download_archive(
+            "https://github.com/example/archive",
+            destination,
+            "0" * 64,
+        )
+
+    assert not destination.exists()
+
+
+def test_archive_setup_needs_no_git_and_is_a_second_run_noop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commit = "1" * 40
+    archive = _runtime_archive(tmp_path, commit)
+    spec = _archive_spec(archive, commit)
+    config = DwellConfig(home=tmp_path / "home")
+    manager, runner, downloads = _archive_manager(config, spec, archive)
+    monkeypatch.setattr(
+        dwell_setup_module.shutil,
+        "which",
+        lambda name: None if name == "git" else f"/test-tools/{name}",
+    )
+
+    installed = manager.run()
+    repeated = manager.run()
+
+    assert installed.changed is True
+    assert repeated.changed is False
+    assert downloads == [spec.archive_url]
+    assert not (manager.runtime_dir / ".git").exists()
+    assert (manager.runtime_dir / ".dwell-source.json").is_file()
+    assert (manager.runtime_dir / ".dwell-source.tar.gz").is_file()
+    assert not any(Path(command[0]).name == "git" for command, _cwd, _env in runner.commands)
+
+
+def test_archive_source_tampering_is_never_overwritten(tmp_path: Path) -> None:
+    commit = "2" * 40
+    archive = _runtime_archive(tmp_path, commit)
+    spec = _archive_spec(archive, commit)
+    config = DwellConfig(home=tmp_path / "home")
+    manager, _runner, _downloads = _archive_manager(config, spec, archive)
+    manager.run()
+    source = manager.runtime_dir / "runtime.txt"
+    source.write_text("changed locally\n", encoding="utf-8")
+
+    with pytest.raises(DwellError, match="refused to overwrite"):
+        manager.run(SetupMode.UPGRADE)
+
+    assert source.read_text(encoding="utf-8") == "changed locally\n"
+
+
+def test_archive_identity_tampering_is_classified_dirty(tmp_path: Path) -> None:
+    commit = "a" * 40
+    archive = _runtime_archive(tmp_path, commit)
+    spec = _archive_spec(archive, commit)
+    config = DwellConfig(home=tmp_path / "home")
+    manager, _runner, downloads = _archive_manager(config, spec, archive)
+    manager.run()
+    manifest_path = manager.runtime_dir / ".dwell-source.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["source"]["archive_url"] = f"https://example.invalid/{commit}.tar.gz"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    inspection = manager.inspect()
+
+    assert inspection.dirty is True
+    assert inspection.source_valid is False
+    with pytest.raises(DwellError, match="refused to overwrite"):
+        manager.run(SetupMode.UPGRADE)
+    assert downloads == [spec.archive_url]
+
+
+def test_deep_archive_manifest_is_reported_unreadable(tmp_path: Path) -> None:
+    commit = "b" * 40
+    archive = _runtime_archive(tmp_path, commit)
+    spec = _archive_spec(archive, commit)
+    config = DwellConfig(home=tmp_path / "home")
+    manager, _runner, _downloads = _archive_manager(config, spec, archive)
+    manager.run()
+    manifest_path = manager.runtime_dir / ".dwell-source.json"
+    manifest_path.write_text("[" * 2_000 + "0" + "]" * 2_000, encoding="utf-8")
+
+    inspection = manager.inspect()
+
+    assert inspection.dirty is True
+    assert inspection.source_valid is False
+    assert "manifest is missing or unreadable" in inspection.problems[0]
+
+
+def test_archive_checksum_mismatch_is_rejected_before_install(tmp_path: Path) -> None:
+    commit = "3" * 40
+    archive = _runtime_archive(tmp_path, commit)
+    spec = _archive_spec(archive, commit, sha256="0" * 64)
+    config = DwellConfig(home=tmp_path / "home")
+    manager, _runner, _downloads = _archive_manager(config, spec, archive)
+
+    with pytest.raises(DwellError, match="checksum verification failed"):
+        manager.run()
+
+    assert not manager.runtime_dir.exists()
+    assert not list(config.tmp_dir.glob("ltx-2-mlx-*"))
+
+
+def test_archive_path_traversal_is_rejected_without_writing_outside_staging(
+    tmp_path: Path,
+) -> None:
+    commit = "4" * 40
+    archive = _runtime_archive(tmp_path, commit, unsafe_name="../escaped.txt")
+    spec = _archive_spec(archive, commit)
+    config = DwellConfig(home=tmp_path / "home")
+    manager, _runner, _downloads = _archive_manager(config, spec, archive)
+
+    with pytest.raises(DwellError, match="unsafe path"):
+        manager.run()
+
+    assert not (tmp_path / "escaped.txt").exists()
+    assert not manager.runtime_dir.exists()
+    assert not list(config.tmp_dir.glob("ltx-2-mlx-*"))
+
+
+def test_archive_upgrade_atomically_replaces_a_clean_prior_archive(tmp_path: Path) -> None:
+    first_commit = "5" * 40
+    second_commit = "6" * 40
+    first_archive = _runtime_archive(tmp_path, first_commit, runtime_text="one\n")
+    second_archive = _runtime_archive(tmp_path, second_commit, runtime_text="two\n")
+    config = DwellConfig(home=tmp_path / "home")
+    first_manager, _runner, _downloads = _archive_manager(
+        config,
+        _archive_spec(first_archive, first_commit),
+        first_archive,
+    )
+    first_manager.run()
+    manager, runner, downloads = _archive_manager(
+        config,
+        _archive_spec(second_archive, second_commit),
+        second_archive,
+    )
+
+    report = manager.run(SetupMode.UPGRADE)
+
+    assert report.changed is True
+    assert (manager.runtime_dir / "runtime.txt").read_text(encoding="utf-8") == "two\n"
+    assert downloads == [manager.runtime.archive_url]
+    assert len(runner.sync_directories) == 1
+    assert not list(config.runtimes_dir.glob(".ltx-2-mlx.backup-*"))
+
+
+def test_archive_upgrade_migrates_the_exact_clean_legacy_git_checkout(tmp_path: Path) -> None:
+    source, commit = _source_repo(tmp_path)
+    config = DwellConfig(home=tmp_path / "home")
+    legacy_manager, _runner = _manager(config, _spec(source, commit))
+    legacy_manager.run()
+    archive = _runtime_archive(tmp_path, commit)
+    archive_spec = _archive_spec(archive, commit, repository=str(source))
+    manager, _runner, downloads = _archive_manager(config, archive_spec, archive)
+
+    report = manager.run(SetupMode.UPGRADE)
+
+    assert report.changed is True
+    assert downloads == [archive_spec.archive_url]
+    assert not (manager.runtime_dir / ".git").exists()
+    assert (manager.runtime_dir / ".dwell-source.json").is_file()
+    assert not list(config.runtimes_dir.glob(".ltx-2-mlx.backup-*"))
+
+
+def test_archive_upgrade_refuses_a_modified_legacy_git_checkout(tmp_path: Path) -> None:
+    source, commit = _source_repo(tmp_path)
+    config = DwellConfig(home=tmp_path / "home")
+    legacy_manager, _runner = _manager(config, _spec(source, commit))
+    legacy_manager.run()
+    local_change = legacy_manager.runtime_dir / "keep-me.txt"
+    local_change.write_text("user data\n", encoding="utf-8")
+    archive = _runtime_archive(tmp_path, commit)
+    manager, _runner, downloads = _archive_manager(
+        config,
+        _archive_spec(archive, commit, repository=str(source)),
+        archive,
+    )
+
+    with pytest.raises(DwellError, match="refused to overwrite"):
+        manager.run(SetupMode.UPGRADE)
+
+    assert local_change.read_text(encoding="utf-8") == "user data\n"
+    assert downloads == []
 
 
 def test_clean_setup_installs_source_then_syncs_only_at_final_path(tmp_path: Path) -> None:
@@ -491,6 +836,8 @@ def test_uv_sync_pins_project_and_venv_despite_ambient_uv_environment(
     monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(tmp_path / "outside-venv"))
     monkeypatch.setenv("UV_CONFIG_FILE", str(tmp_path / "outside.toml"))
     monkeypatch.setenv("UV_NO_INSTALL_PROJECT", "1")
+    monkeypatch.setenv("PIP_CONFIG_FILE", str(tmp_path / "outside-pip.conf"))
+    monkeypatch.setenv("PIP_INDEX_URL", "https://packages.example.invalid/simple")
     monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "active-venv"))
 
     manager.run()
@@ -504,6 +851,8 @@ def test_uv_sync_pins_project_and_venv_despite_ambient_uv_environment(
     assert environment["UV_PROJECT_ENVIRONMENT"] == str(manager.runtime_dir / ".venv")
     assert "UV_CONFIG_FILE" not in environment
     assert "UV_NO_INSTALL_PROJECT" not in environment
+    assert "PIP_CONFIG_FILE" not in environment
+    assert "PIP_INDEX_URL" not in environment
     assert "VIRTUAL_ENV" not in environment
 
 

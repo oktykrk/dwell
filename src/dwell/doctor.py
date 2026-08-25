@@ -140,12 +140,11 @@ def _runtime_audit(config: DwellConfig) -> tuple[list[DoctorCheck], bool]:
     runtime = config.runtimes_dir / "ltx-2-mlx"
     if runtime.is_symlink():
         return [DoctorCheck("LTX runtime", CheckLevel.ERROR, "runtime path is a symlink")], False
-    if not (runtime / ".git").exists():
+    if not runtime.exists():
         return [DoctorCheck("LTX runtime", CheckLevel.WARNING, f"missing: {runtime}")], False
 
     from dwell.setup import (
-        _read_runtime_identity,
-        _runtime_worktree_is_dirty,
+        SetupManager,
         _venv_provenance_is_valid,
         load_runtime_manifest,
     )
@@ -154,42 +153,70 @@ def _runtime_audit(config: DwellConfig) -> tuple[list[DoctorCheck], bool]:
         spec = next(item for item in load_runtime_manifest() if item.id == "ltx-2-mlx")
     except Exception as exc:
         return [DoctorCheck("LTX runtime manifest", CheckLevel.ERROR, str(exc))], False
-    git = shutil.which("git") or "git"
-    remote, commit = _read_runtime_identity(runtime)
-    remote_ok = remote is not None and remote.removesuffix("/") == (
-        spec.repository.removesuffix("/")
-    )
-    commit_ok = commit == spec.commit
-    dirty = commit is None or _runtime_worktree_is_dirty(
-        runtime, expected_commit=commit, executable=git, runner=_run
-    )
+    inspection = SetupManager(config, runtime=spec, runner=_run).inspect(probe_venv=False)
     results = [
         DoctorCheck("LTX runtime", CheckLevel.OK, str(runtime)),
-        DoctorCheck(
-            "LTX remote",
-            CheckLevel.OK if remote_ok else CheckLevel.ERROR,
-            remote or "unreadable",
-        ),
-        DoctorCheck(
-            "LTX commit",
-            CheckLevel.OK if commit_ok else CheckLevel.ERROR,
-            commit or "unreadable",
-        ),
-        DoctorCheck(
-            "LTX working tree",
-            CheckLevel.WARNING if dirty else CheckLevel.OK,
-            "local changes present" if dirty else "clean",
-        ),
     ]
+    if spec.uses_archive:
+        archive_ok = inspection.remote == spec.archive_url
+        checksum_ok = inspection.source_hash == spec.archive_sha256
+        results.extend(
+            (
+                DoctorCheck(
+                    "LTX archive",
+                    CheckLevel.OK if archive_ok else CheckLevel.ERROR,
+                    inspection.remote or "unreadable",
+                ),
+                DoctorCheck(
+                    "LTX commit",
+                    CheckLevel.OK if inspection.commit == spec.commit else CheckLevel.ERROR,
+                    inspection.commit or "unreadable",
+                ),
+                DoctorCheck(
+                    "LTX archive checksum",
+                    CheckLevel.OK if checksum_ok else CheckLevel.ERROR,
+                    inspection.source_hash or "unreadable",
+                ),
+                DoctorCheck(
+                    "LTX source tree",
+                    CheckLevel.WARNING if inspection.dirty else CheckLevel.OK,
+                    "local or unsafe changes present" if inspection.dirty else "clean",
+                ),
+            )
+        )
+    else:
+        repository = spec.repository or ""
+        remote_ok = inspection.remote is not None and inspection.remote.removesuffix(
+            "/"
+        ) == repository.removesuffix("/")
+        results.extend(
+            (
+                DoctorCheck(
+                    "LTX remote",
+                    CheckLevel.OK if remote_ok else CheckLevel.ERROR,
+                    inspection.remote or "unreadable",
+                ),
+                DoctorCheck(
+                    "LTX commit",
+                    CheckLevel.OK if inspection.commit == spec.commit else CheckLevel.ERROR,
+                    inspection.commit or "unreadable",
+                ),
+                DoctorCheck(
+                    "LTX working tree",
+                    CheckLevel.WARNING if inspection.dirty else CheckLevel.OK,
+                    "local changes present" if inspection.dirty else "clean",
+                ),
+            )
+        )
 
-    source_trusted = remote_ok and commit_ok and not dirty
+    source_trusted = inspection.source_valid and not inspection.dirty
     if not source_trusted:
-        level = CheckLevel.ERROR if not remote_ok or not commit_ok else CheckLevel.WARNING
+        detail = "; ".join(inspection.problems) or "source verification failed"
         results.append(
             DoctorCheck(
                 "LTX CLI",
-                level,
-                "not executed because the runtime source is not the pinned, clean checkout",
+                CheckLevel.ERROR,
+                "not executed because the runtime source is not trusted: " + detail,
             )
         )
         return results, False
@@ -314,7 +341,6 @@ def run_doctor(config: DwellConfig | None = None) -> list[DoctorCheck]:
     checks.extend(
         (
             _tool_check("uv", ["--version"]),
-            _tool_check("git", ["--version"]),
             _tool_check("ffmpeg", ["-version"]),
             _tool_check("ffprobe", ["-version"]),
         )

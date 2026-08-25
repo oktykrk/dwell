@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       publish:
-        description: Create or resume the tag, GitHub Release, and Homebrew formula update
+        description: Create or resume the immutable tag and GitHub Release
         required: true
         default: false
         type: boolean
@@ -24,18 +24,16 @@ concurrency:
 
 jobs:
   validate:
-    runs-on: macos-15
-    timeout-minutes: 120
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
     outputs:
       dispatch_sha: ${{ steps.release.outputs.dispatch_sha }}
-      formula_digest: ${{ steps.formula.outputs.digest }}
       mode: ${{ steps.release.outputs.mode }}
       release_sha: ${{ steps.release.outputs.release_sha }}
       release_tag: ${{ steps.release.outputs.release_tag }}
     env:
       DISPATCH_REF: ${{ github.ref }}
       HF_HUB_OFFLINE: "1"
-      HOMEBREW_NO_AUTO_UPDATE: "1"
       RELEASE_VERSION: ${{ inputs.version }}
       TRANSFORMERS_OFFLINE: "1"
 
@@ -46,9 +44,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ github.sha }}
-
-      - name: Verify Apple Silicon runner
-        run: test "$(uname -m)" = "arm64"
 
       - name: Resolve and verify release request
         id: release
@@ -61,14 +56,13 @@ jobs:
             exit 1
           }
 
-          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$ ]] || {
+          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "Invalid release version: $RELEASE_VERSION" >&2
             exit 1
           }
 
           dispatch_sha=$(git rev-parse HEAD)
           test "$dispatch_sha" = "$GITHUB_SHA"
-
           release_tag="v$RELEASE_VERSION"
           tag_ref="refs/tags/$release_tag"
 
@@ -83,19 +77,6 @@ jobs:
               exit 1
             }
             mode="resume"
-
-            formula_tag=$(git show "$dispatch_sha:Formula/dwell.rb" \
-              | sed -n 's/^      tag: *"\([^"]*\)",$/\1/p')
-            formula_revision=$(git show "$dispatch_sha:Formula/dwell.rb" \
-              | sed -n 's/^      revision: *"\([0-9a-f]*\)"$/\1/p')
-            test "$formula_tag" = "$release_tag" || {
-              echo "Existing tag $release_tag is not the release currently recorded by Formula/dwell.rb." >&2
-              exit 1
-            }
-            test "$formula_revision" = "$release_sha" || {
-              echo "Formula/dwell.rb does not point to the existing $release_tag commit." >&2
-              exit 1
-            }
           else
             release_sha="$dispatch_sha"
             mode="new"
@@ -110,10 +91,13 @@ jobs:
             exit 1
           }
 
-          echo "DISPATCH_SHA=$dispatch_sha" >> "$GITHUB_ENV"
+          source_date_epoch=$(git show -s --format=%ct "$release_sha")
+          test -n "$source_date_epoch"
+
           echo "RELEASE_MODE=$mode" >> "$GITHUB_ENV"
           echo "RELEASE_SHA=$release_sha" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$source_date_epoch" >> "$GITHUB_ENV"
           echo "dispatch_sha=$dispatch_sha" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
@@ -124,8 +108,9 @@ jobs:
       - name: Install uv and Python
         uses: astral-sh/setup-uv@v9.0.0
         with:
-          python-version: "3.11"
-          enable-cache: false
+          version: "0.11.32"
+          python-version: "3.11.15"
+          enable-cache: true
 
       - name: Install locked development environment
         run: uv sync --locked --all-groups
@@ -149,14 +134,16 @@ jobs:
         run: |
           set -euo pipefail
 
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+
           smoke_venv="$RUNNER_TEMP/dwell-release-smoke"
           smoke_home="$RUNNER_TEMP/dwell-home"
-          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
-          test -n "$wheel"
-          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
-
-          uv venv "$smoke_venv" --python 3.11
-          uv pip install --python "$smoke_venv/bin/python" "$wheel"
+          uv venv "$smoke_venv" --python 3.11.15
+          uv pip install --python "$smoke_venv/bin/python" "${wheels[0]}"
 
           DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" --version \
             | grep -F "Dwell $RELEASE_VERSION"
@@ -165,148 +152,68 @@ jobs:
             | grep -F "ltx-2.5-bf16"
           DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" models list \
             | grep -F "qwen3-coder-30b-a3b-4bit"
-          "$smoke_venv/bin/python" -c \
-            "import importlib.metadata; import mlx_lm.server; assert importlib.metadata.version('mlx-lm') == '0.31.3'"
 
-      - name: Prepare Homebrew source formula
+      - name: Prepare installer release assets
         shell: bash
         run: |
           set -euo pipefail
 
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if test "$RELEASE_MODE" = "new"; then
-            git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Dwell $RELEASE_TAG"
-          fi
+          requirements="requirements-macos-arm64-py311.txt"
+          uv export \
+            --format requirements-txt \
+            --locked \
+            --no-dev \
+            --no-emit-project \
+            --no-sources \
+            --output-file "dist/$requirements"
 
-          python - <<'PY'
-          import os
-          import re
-          from pathlib import Path
+          grep -E '^mlx-lm==0\.31\.3 ' "dist/$requirements" \
+            | grep -F "platform_machine == 'arm64'" \
+            | grep -F "sys_platform == 'darwin'"
+          ! grep -E '^(dwell-ai|pytest(-asyncio)?|ruff)==' "dist/$requirements"
 
-          formula = Path("Formula/dwell.rb")
-          content = formula.read_text(encoding="utf-8")
-          pattern = re.compile(
-              r'(?m)^(  url "ssh://git@github\.com/oktykrk/dwell\.git",\n'
-              r'      tag:\s+)"[^"]+"(,\n'
-              r'      revision:\s+)"[0-9a-f]{40}"$'
-          )
-          tag = os.environ["RELEASE_TAG"]
-          revision = os.environ["RELEASE_SHA"]
-          updated, replacements = pattern.subn(
-              lambda match: (
-                  f'{match.group(1)}"{tag}"{match.group(2)}"{revision}"'
-              ),
-              content,
-          )
-          if replacements != 1:
-              raise SystemExit(
-                  f"expected one Dwell formula source block, found {replacements}"
-              )
+          # uv treats --no-build and --only-binary :all: as mutually exclusive;
+          # the latter provides the stronger wheel-only validation.
+          MACOSX_DEPLOYMENT_TARGET=14.0 uv --no-config pip sync \
+            "dist/$requirements" \
+            --target "$RUNNER_TEMP/dwell-requirements-check" \
+            --python-version 3.11.15 \
+            --python-platform aarch64-apple-darwin \
+            --require-hashes \
+            --only-binary :all: \
+            --strict \
+            --dry-run
 
-          bottle_pattern = re.compile(r"(?ms)^  bottle do\n.*?^  end\n\n")
-          bottle_blocks = bottle_pattern.findall(updated)
-          if len(bottle_blocks) > 1:
-              raise SystemExit(
-                  f"expected at most one Homebrew bottle block, found {len(bottle_blocks)}"
-              )
-          updated = bottle_pattern.sub("", updated)
-          formula.write_text(updated, encoding="utf-8")
-          PY
-
-          git diff --check
-          git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
-          git diff -- Formula/dwell.rb
-
-          git switch --create release-formula
-          git add Formula/dwell.rb
-          test "$(git diff --cached --name-only)" = "Formula/dwell.rb"
-          git commit -m "Prepare Homebrew formula for $RELEASE_TAG"
-          test "$(git rev-parse HEAD^)" = "$RELEASE_SHA"
-
-      - name: Build and validate Homebrew bottle
-        id: formula
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          test "$(uname -m)" = "arm64"
-          test "$(brew --prefix)" = "/opt/homebrew"
-          test ! -e "$(brew --cellar)/dwell"
-
-          # The tap clone sees local commit B, while the Formula source resolves local tag A.
-          git config --global --add \
-            url."file://${GITHUB_WORKSPACE}/".insteadOf \
-            "ssh://git@github.com/oktykrk/dwell.git"
-
-          brew style Formula/dwell.rb
-          brew tap oktykrk/dwell "$GITHUB_WORKSPACE"
-          brew audit --strict oktykrk/dwell/dwell
-          brew install --build-bottle oktykrk/dwell/dwell
-          brew test oktykrk/dwell/dwell
-
-          smoke_home="$RUNNER_TEMP/dwell-homebrew-home"
-          DWELL_HOME="$smoke_home" dwell --version | grep -F "Dwell $RELEASE_VERSION"
-          DWELL_HOME="$smoke_home" dwell config show | grep -F "$smoke_home"
-          DWELL_HOME="$smoke_home" dwell models list | grep -F "ltx-2.5-bf16"
-          DWELL_HOME="$smoke_home" dwell models list | grep -F "qwen3-coder-30b-a3b-4bit"
-          "$(brew --prefix dwell)/libexec/bin/python" -c \
-            "import importlib.metadata; import mlx_lm.server; assert importlib.metadata.version('mlx-lm') == '0.31.3'"
-
-          bottle_root_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
-          brew bottle --json --no-rebuild \
-            --root-url="$bottle_root_url" \
-            --root-url-using=DwellGitHubReleaseDownloadStrategy \
-            oktykrk/dwell/dwell
+          test -f install.sh
+          test -x install.sh
+          /bin/sh -n install.sh
+          grep -F "requirements-macos-arm64-py311.txt" install.sh
+          grep -F "SHA256SUMS" install.sh
+          cp install.sh dist/install.sh
+          chmod 0755 dist/install.sh
 
           shopt -s nullglob
-          bottle_jsons=(dwell--*.bottle.json)
-          bottle_files=(dwell--*.bottle.tar.gz)
-          test "${#bottle_jsons[@]}" -eq 1
-          test "${#bottle_files[@]}" -eq 1
-          bottle_json="${bottle_jsons[0]}"
-          bottle_file="${bottle_files[0]}"
-          expected_filename=$(jq -r \
-            'to_entries[0].value.bottle.tags | to_entries[0].value.local_filename' \
-            "$bottle_json")
-          test "$(basename "$bottle_file")" = "$expected_filename"
+          wheels=(dist/*.whl)
+          sdists=(dist/*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
 
-          brew bottle --merge --write --no-commit \
-            --root-url-using=DwellGitHubReleaseDownloadStrategy \
-            "$bottle_json"
-          tap_formula="$(brew --repository oktykrk/dwell)/Formula/dwell.rb"
-          test -f "$tap_formula"
-          cp "$tap_formula" Formula/dwell.rb
+          release_inputs=(
+            "$(basename "${wheels[0]}")"
+            "$(basename "${sdists[0]}")"
+            "$requirements"
+            "install.sh"
+          )
+          mapfile -t dist_files < <(find dist -maxdepth 1 -type f -print | sort)
+          test "${#dist_files[@]}" -eq "${#release_inputs[@]}"
 
-          bottle_sha=$(shasum -a 256 "$bottle_file" | awk '{print $1}')
-          grep -F "root_url \"$bottle_root_url\"" Formula/dwell.rb
-          grep -F "$bottle_sha" Formula/dwell.rb
-          brew style Formula/dwell.rb
-          brew audit --strict oktykrk/dwell/dwell
+          (
+            cd dist
+            sha256sum "${release_inputs[@]}" > SHA256SUMS
+            sha256sum --check SHA256SUMS
+          )
 
-          if test "$RELEASE_MODE" = "resume"; then
-            current_formula="$RUNNER_TEMP/current-dwell.rb"
-            git show "$DISPATCH_SHA:Formula/dwell.rb" > "$current_formula"
-            cmp Formula/dwell.rb "$current_formula" || {
-              echo "The current Formula differs from the rebuilt $RELEASE_TAG bottle." >&2
-              exit 1
-            }
-          fi
-
-          git diff --check
-          git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
-          test "$(git diff --name-only)" = "Formula/dwell.rb"
-          git add Formula/dwell.rb
-          git commit --amend -m "Update Homebrew formula for $RELEASE_TAG"
-          test "$(git rev-parse HEAD^)" = "$RELEASE_SHA"
-
-          mkdir -p dist/homebrew
-          mv "$bottle_json" "$bottle_file" dist/homebrew/
-
-          digest=$(shasum -a 256 Formula/dwell.rb | awk '{print $1}')
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Save validated release inputs
+      - name: Save validated release assets
         if: inputs.publish
         uses: actions/upload-artifact@v7.0.1
         with:
@@ -314,170 +221,149 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 7
-          path: |
-            dist/*.tar.gz
-            dist/*.whl
-            dist/homebrew/*.bottle.*
-            Formula/dwell.rb
+          path: dist/
 
       - name: Summarize validation-only run
         if: ${{ !inputs.publish }}
         run: |
-          echo "Release $RELEASE_TAG passed project, package, Homebrew, and bottle validation."
+          echo "Release $RELEASE_TAG passed lock, test, package, and installer validation."
           echo "Nothing was pushed because publish was not selected."
 
   publish:
     if: inputs.publish
     needs: validate
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
     permissions:
       contents: write
     env:
       DISPATCH_SHA: ${{ needs.validate.outputs.dispatch_sha }}
-      FORMULA_DIGEST: ${{ needs.validate.outputs.formula_digest }}
       RELEASE_MODE: ${{ needs.validate.outputs.mode }}
       RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
 
     steps:
-      - name: Check out verified main commit
+      - name: Check out the verified main commit
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.dispatch_sha }}
 
-      - name: Download validated release inputs
+      - name: Download validated release assets
         uses: actions/download-artifact@v8.0.1
         with:
           name: dwell-release-${{ inputs.version }}
           path: ${{ runner.temp }}/dwell-release
 
-      - name: Publish or verify immutable Git refs
-        id: refs
+      - name: Verify downloaded release assets
         shell: bash
         run: |
           set -euo pipefail
 
-          validated_formula="$RUNNER_TEMP/dwell-release/Formula/dwell.rb"
-          release_formula="$RUNNER_TEMP/release-source-dwell.rb"
-          test -f "$validated_formula"
-          test "$(sha256sum "$validated_formula" | awk '{print $1}')" = "$FORMULA_DIGEST"
-
+          release_dir="$RUNNER_TEMP/dwell-release"
+          requirements="$release_dir/requirements-macos-arm64-py311.txt"
           shopt -s nullglob
-          bottle_files=("$RUNNER_TEMP"/dwell-release/dist/homebrew/*.bottle.tar.gz)
-          bottle_jsons=("$RUNNER_TEMP"/dwell-release/dist/homebrew/*.bottle.json)
-          test "${#bottle_files[@]}" -eq 1
-          test "${#bottle_jsons[@]}" -eq 1
-          bottle_sha=$(sha256sum "${bottle_files[0]}" | awk '{print $1}')
-          grep -F "$bottle_sha" "$validated_formula"
+          wheels=("$release_dir"/*.whl)
+          sdists=("$release_dir"/*.tar.gz)
+          test "${#wheels[@]}" -eq 1
+          test "${#sdists[@]}" -eq 1
+          test -f "$requirements"
+          test -f "$release_dir/install.sh"
+          test -f "$release_dir/SHA256SUMS"
+
+          expected_payloads=(
+            "$(basename "${wheels[0]}")"
+            "$(basename "${sdists[0]}")"
+            "$(basename "$requirements")"
+            "install.sh"
+          )
+          expected_files=(
+            "${wheels[0]}"
+            "${sdists[0]}"
+            "$requirements"
+            "$release_dir/install.sh"
+            "$release_dir/SHA256SUMS"
+          )
+          mapfile -t actual_files < <(find "$release_dir" -maxdepth 1 -type f -print | sort)
+          test "${#actual_files[@]}" -eq "${#expected_files[@]}"
+          test "$(printf '%s\n' "${actual_files[@]}")" = \
+            "$(printf '%s\n' "${expected_files[@]}" | sort)"
+
+          mapfile -t checksum_names < <(awk '{ print $2 }' "$release_dir/SHA256SUMS" | sort)
+          test "$(printf '%s\n' "${checksum_names[@]}")" = \
+            "$(printf '%s\n' "${expected_payloads[@]}" | sort)"
+          (cd "$release_dir" && sha256sum --check SHA256SUMS)
+
+      - name: Publish or verify immutable release tag
+        shell: bash
+        run: |
+          set -euo pipefail
 
           test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"
-          git show "$RELEASE_SHA:Formula/dwell.rb" > "$release_formula"
-          release_formula_digest=$(sha256sum "$release_formula" | awk '{print $1}')
-          tag_ref="refs/tags/$RELEASE_TAG"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if ! git show-ref --verify --quiet "$tag_ref"; then
-            test "$RELEASE_MODE" = "new" || {
-              echo "The existing release tag disappeared after validation." >&2
-              exit 1
-            }
-            git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Dwell $RELEASE_TAG"
-          fi
-          test "$(git cat-file -t "$tag_ref")" = "tag"
-          test "$(git rev-list -n 1 "$tag_ref")" = "$RELEASE_SHA"
-
-          refs_ready="false"
-          failed_main=""
-          for attempt in 1 2 3 4 5; do
-            git fetch origin \
-              "+refs/heads/main:refs/remotes/origin/main"
-            remote_main=$(git rev-parse refs/remotes/origin/main)
-            git merge-base --is-ancestor "$RELEASE_SHA" "$DISPATCH_SHA" || {
-              echo "The release tag is not in the selected main history." >&2
-              exit 1
-            }
-            git merge-base --is-ancestor "$DISPATCH_SHA" "$remote_main" || {
-              echo "The selected release commit is no longer in main history." >&2
-              exit 1
-            }
-
-            remote_refs=$(git ls-remote --tags origin \
-              "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
-            remote_tag=$(printf '%s\n' "$remote_refs" \
-              | awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref { print $1 }')
-            remote_revision=$(printf '%s\n' "$remote_refs" \
-              | awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref { print $1 }')
-            remote_formula_digest=$(git show "$remote_main:Formula/dwell.rb" \
-              | sha256sum | awk '{print $1}')
-
-            if test -n "$remote_tag"; then
-              test -n "$remote_revision" || {
-                echo "Remote $RELEASE_TAG is not an annotated tag." >&2
-                exit 1
-              }
-              test "$remote_revision" = "$RELEASE_SHA" || {
-                echo "Remote $RELEASE_TAG points to a different commit." >&2
-                exit 1
-              }
-              test "$remote_formula_digest" = "$FORMULA_DIGEST" || {
-                echo "Remote Formula/dwell.rb does not match $RELEASE_TAG." >&2
-                exit 1
-              }
-
-              formula_sha=$(git log -1 --format=%H "$remote_main" -- Formula/dwell.rb)
-              test -n "$formula_sha"
-              refs_ready="true"
-              break
-            fi
-
-            test "$RELEASE_MODE" = "new" || {
-              echo "Remote $RELEASE_TAG disappeared after validation." >&2
-              exit 1
-            }
-            test "$remote_formula_digest" = "$release_formula_digest" || {
-              echo "Formula/dwell.rb changed after the release was dispatched." >&2
-              exit 1
-            }
-            test "$remote_main" != "$failed_main" || {
-              echo "Publishing refs failed without a concurrent main update." >&2
-              exit 1
-            }
-
-            git switch --force-create release-formula "$remote_main"
-            cp "$validated_formula" Formula/dwell.rb
-            git diff --check
-            git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
-            test "$(git diff --name-only)" = "Formula/dwell.rb"
-            git add Formula/dwell.rb
-            git commit -m "Update Homebrew formula for $RELEASE_TAG"
-            test "$(git rev-parse HEAD^)" = "$remote_main"
-
-            if git push --atomic origin \
-              "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" \
-              "HEAD:refs/heads/main"; then
-              formula_sha=$(git rev-parse HEAD)
-              refs_ready="true"
-              break
-            fi
-            failed_main="$remote_main"
-          done
-
-          test "$refs_ready" = "true" || {
-            echo "main kept changing while the release was being published." >&2
+          git fetch origin "+refs/heads/main:refs/remotes/origin/main"
+          remote_main=$(git rev-parse refs/remotes/origin/main)
+          git merge-base --is-ancestor "$RELEASE_SHA" "$DISPATCH_SHA" || {
+            echo "The release commit is not in the selected main history." >&2
+            exit 1
+          }
+          git merge-base --is-ancestor "$DISPATCH_SHA" "$remote_main" || {
+            echo "The selected release commit is no longer in main history." >&2
             exit 1
           }
 
-          echo "formula_sha=$formula_sha" >> "$GITHUB_OUTPUT"
+          tag_ref="refs/tags/$RELEASE_TAG"
+          remote_refs=$(git ls-remote --tags origin "$tag_ref" "$tag_ref^{}")
+          remote_tag=$(printf '%s\n' "$remote_refs" \
+            | awk -v ref="$tag_ref" '$2 == ref { print $1 }')
+          remote_revision=$(printf '%s\n' "$remote_refs" \
+            | awk -v ref="$tag_ref^{}" '$2 == ref { print $1 }')
 
-      - name: Publish or repair GitHub release
+          if test -z "$remote_tag"; then
+            test "$RELEASE_MODE" = "new" || {
+              echo "The existing $RELEASE_TAG disappeared after validation." >&2
+              exit 1
+            }
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Dwell $RELEASE_TAG"
+            if ! git push origin "$tag_ref:$tag_ref"; then
+              echo "Tag push raced with another publisher; verifying the remote tag."
+            fi
+
+            remote_refs=$(git ls-remote --tags origin "$tag_ref" "$tag_ref^{}")
+            remote_tag=$(printf '%s\n' "$remote_refs" \
+              | awk -v ref="$tag_ref" '$2 == ref { print $1 }')
+            remote_revision=$(printf '%s\n' "$remote_refs" \
+              | awk -v ref="$tag_ref^{}" '$2 == ref { print $1 }')
+          fi
+
+          test -n "$remote_tag" || {
+            echo "Remote tag $RELEASE_TAG was not created." >&2
+            exit 1
+          }
+          test -n "$remote_revision" || {
+            echo "Remote $RELEASE_TAG is not an annotated tag." >&2
+            exit 1
+          }
+          test "$remote_revision" = "$RELEASE_SHA" || {
+            echo "Remote $RELEASE_TAG points to a different commit." >&2
+            exit 1
+          }
+
+      - name: Publish, resume, or verify GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
+
+          release_dir="$RUNNER_TEMP/dwell-release"
+          mapfile -t release_assets < <(find "$release_dir" -maxdepth 1 -type f -print | sort)
+          test "${#release_assets[@]}" -eq 5
+
+          expected_names="$RUNNER_TEMP/expected-release-assets.txt"
+          printf '%s\n' "${release_assets[@]##*/}" | sort > "$expected_names"
+          release_json="$RUNNER_TEMP/release.json"
 
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" \
@@ -487,33 +373,76 @@ jobs:
               --title "Dwell $RELEASE_TAG"
           fi
 
-          is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)
-          mapfile -t release_assets < <(
-            find "$RUNNER_TEMP/dwell-release/dist" -type f \
-              \( -name '*.whl' -o -name '*.tar.gz' \) -print | sort
-          )
-          test "${#release_assets[@]}" -eq 3
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          is_draft=$(jq -r '.draft' "$release_json")
           if test "$is_draft" = "true"; then
+            expected_names_json=$(jq -R -s \
+              'split("\n") | map(select(length > 0))' "$expected_names")
+            mapfile -t unexpected_asset_ids < <(
+              jq -r --argjson expected "$expected_names_json" \
+                '.assets[] | select(.name as $name | ($expected | index($name)) == null) | .id' \
+                "$release_json"
+            )
+
+            for asset_id in "${unexpected_asset_ids[@]}"; do
+              [[ "$asset_id" =~ ^[0-9]+$ ]] || {
+                echo "GitHub returned an invalid release asset ID: $asset_id" >&2
+                exit 1
+              }
+              current_is_draft=$(gh api \
+                "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')
+              test "$current_is_draft" = "true" || {
+                echo "Release was published while its draft assets were being repaired; refusing to mutate it." >&2
+                exit 1
+              }
+              gh api --method DELETE \
+                "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            done
+
+            current_is_draft=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')
+            test "$current_is_draft" = "true" || {
+              echo "Release was published before its draft assets could be uploaded; refusing to mutate it." >&2
+              exit 1
+            }
             gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
           fi
 
-          release_json="$RUNNER_TEMP/release.json"
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
-          for artifact in "${release_assets[@]}"; do
-            asset_name=$(basename "$artifact")
-            expected_digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
-            actual_digest=$(jq -r --arg name "$asset_name" \
-              '.assets[] | select(.name == $name) | .digest' "$release_json")
-            test "$actual_digest" = "$expected_digest" || {
-              echo "Release asset $asset_name is missing or has the wrong digest." >&2
-              exit 1
-            }
+          verify_release_assets() {
+            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json" \
+              || return 1
+            jq -r '.assets[].name' "$release_json" | sort > "$RUNNER_TEMP/actual-release-assets.txt"
+            cmp "$expected_names" "$RUNNER_TEMP/actual-release-assets.txt" || return 1
+
+            for artifact in "${release_assets[@]}"; do
+              asset_name=$(basename "$artifact")
+              expected_digest="sha256:$(sha256sum "$artifact" | awk '{ print $1 }')"
+              actual_digest=$(jq -r --arg name "$asset_name" \
+                '.assets[] | select(.name == $name) | .digest' "$release_json")
+              test "$actual_digest" = "$expected_digest" || return 1
+            done
+          }
+
+          assets_verified="false"
+          for attempt in 1 2 3 4 5; do
+            if verify_release_assets; then
+              assets_verified="true"
+              break
+            fi
+            test "$attempt" -eq 5 || sleep 2
           done
+          test "$assets_verified" = "true" || {
+            echo "GitHub Release assets are missing, unexpected, or have the wrong digest." >&2
+            exit 1
+          }
 
           if test "$is_draft" = "true"; then
-            gh release edit "$RELEASE_TAG" --draft=false --title "Dwell $RELEASE_TAG"
+            current_is_draft=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')
+            if test "$current_is_draft" = "true"; then
+              gh release edit "$RELEASE_TAG" --draft=false --title "Dwell $RELEASE_TAG"
+            fi
           fi
 
           release_url=$(gh release view "$RELEASE_TAG" --json url --jq .url)
-          echo "Published $RELEASE_TAG from $RELEASE_SHA: $release_url"
-          echo "Formula/dwell.rb is on main at ${{ steps.refs.outputs.formula_sha }}."
+          echo "Published or verified $RELEASE_TAG from $RELEASE_SHA: $release_url"
