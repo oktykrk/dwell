@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dwell import doctor as doctor_module
 from dwell.config import DwellConfig
-from dwell.doctor import CheckLevel, _environment_checks, _runtime_checks
+from dwell.doctor import CheckLevel, _environment_checks, _mlx_lm_checks, _runtime_checks
 
 
 def test_ltx_doctor_help_is_strictly_offline_and_never_syncs(
@@ -188,3 +188,49 @@ def test_explicit_wrong_hugging_face_shell_variables_warn(
     checks = _environment_checks(config)
 
     assert all(check.level == CheckLevel.WARNING for check in checks)
+
+
+def test_mlx_lm_doctor_check_is_offline(tmp_path: Path, monkeypatch) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    captured: dict[str, object] = {}
+
+    def fake_run(command, *, env=None, cwd=None, timeout=10):  # type: ignore[no-untyped-def]
+        del cwd, timeout
+        captured["command"] = command
+        captured["env"] = env
+        return subprocess.CompletedProcess(command, 0, "0.31.3\n", "")
+
+    monkeypatch.setattr(doctor_module, "_run", fake_run)
+
+    checks = _mlx_lm_checks(config)
+
+    assert checks == [
+        doctor_module.DoctorCheck(
+            "MLX-LM runtime",
+            CheckLevel.OK,
+            f"0.31.3 via {doctor_module.sys.executable}",
+        )
+    ]
+    assert captured["env"]["HF_HUB_OFFLINE"] == "1"  # type: ignore[index]
+
+
+def test_mlx_lm_doctor_check_rejects_missing_or_wrong_runtime(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    results = iter(
+        (
+            subprocess.CompletedProcess(["python"], 1, "", "module missing\n"),
+            subprocess.CompletedProcess(["python"], 0, "0.31.2\n", ""),
+        )
+    )
+    monkeypatch.setattr(doctor_module, "_run", lambda *_args, **_kwargs: next(results))
+
+    missing = _mlx_lm_checks(config)
+    wrong = _mlx_lm_checks(config)
+
+    assert missing[0].level == CheckLevel.ERROR
+    assert missing[0].detail == "module missing"
+    assert wrong[0].level == CheckLevel.ERROR
+    assert "Dwell expects 0.31.3" in wrong[0].detail

@@ -15,8 +15,12 @@ class Dwell < Formula
   depends_on "ffmpeg"
   depends_on "git"
   depends_on "libyaml"
-  depends_on :macos
+  depends_on macos: :sonoma
+  depends_on "mlx"
+  depends_on "numpy"
+  depends_on "protobuf"
   depends_on "python@3.14"
+  depends_on "sentencepiece"
   depends_on "uv"
 
   resource "annotated-doc" do
@@ -89,9 +93,19 @@ class Dwell < Formula
     sha256 "5e0811a4383b21dc5838069f801c4fb62113b7447663d2530d2bd6e77b49bf15"
   end
 
+  resource "jinja2" do
+    url "https://files.pythonhosted.org/packages/df/bf/f7da0350254c0ed7c72f3e33cef02e048281fec7ecec5f032d4aac52226b/jinja2-3.1.6.tar.gz"
+    sha256 "0137fb05990d35f1275a587e9aee6d56da821fc83491a0fb838183be43f66d6d"
+  end
+
   resource "markdown-it-py" do
     url "https://files.pythonhosted.org/packages/06/ff/7841249c247aa650a76b9ee4bbaeae59370dc8bfd2f6c01f3630c35eb134/markdown_it_py-4.2.0.tar.gz"
     sha256 "04a21681d6fbb623de53f6f364d352309d4094dd4194040a10fd51833e418d49"
+  end
+
+  resource "markupsafe" do
+    url "https://files.pythonhosted.org/packages/7e/99/7690b6d4034fffd95959cbe0c02de8deb3098cc577c67bb6a24fe5d7caa7/markupsafe-3.0.3.tar.gz"
+    sha256 "722695808f4b6457b320fdc131280796bdceb04ab50fe1795cd540799ebe1698"
   end
 
   resource "mdurl" do
@@ -99,9 +113,19 @@ class Dwell < Formula
     sha256 "bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba"
   end
 
+  resource "mlx-lm" do
+    url "https://files.pythonhosted.org/packages/84/94/9a38d6b0c6fcca995b9136c94eb7da1e9c5165652edf228b96b29960fa7a/mlx_lm-0.31.3.tar.gz"
+    sha256 "61eb0e3ba09444f77f874aff295401d7ccd20b39495cbbce0c782a15474ce733"
+  end
+
   resource "packaging" do
     url "https://files.pythonhosted.org/packages/7d/fa/3944b40b07da9ce895c0e6303a5ab7d53da063554f534556b134a54d6093/packaging-26.3.tar.gz"
     sha256 "94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79"
+  end
+
+  resource "protobuf" do
+    url "https://files.pythonhosted.org/packages/a7/e7/0553e21d25ca4d9f573135775348a372c3ec34a93a71d5f297c3bac38341/protobuf-7.36.0.tar.gz"
+    sha256 "e8e09cb0d794c6687926fa558a8a6e72aa10edb997d5ca61da0765f12a3e00ea"
   end
 
   resource "pydantic" do
@@ -124,9 +148,24 @@ class Dwell < Formula
     sha256 "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f"
   end
 
+  resource "regex" do
+    url "https://files.pythonhosted.org/packages/20/98/04b13f1ddfb63158025291c02e03eb42fbb7acb51d091d541050eb4e35e8/regex-2026.7.19.tar.gz"
+    sha256 "7e77b324909c1617cbb4c668677e2c6ae13f44d7c1de0d4f15f2e3c10f3315b5"
+  end
+
   resource "rich" do
     url "https://files.pythonhosted.org/packages/c0/8f/0722ca900cc807c13a6a0c696dacf35430f72e0ec571c4275d2371fca3e9/rich-15.0.0.tar.gz"
     sha256 "edd07a4824c6b40189fb7ac9bc4c52536e9780fbbfbddf6f1e2502c31b068c36"
+  end
+
+  resource "safetensors" do
+    url "https://files.pythonhosted.org/packages/45/06/f955dbbb1859e3bd23c8ac6141af5106e7ad5fedec4a3a6e3d60f94b7001/safetensors-0.8.0.tar.gz"
+    sha256 "fabaf3e0f18a6618d9b36560682562157f77c2b71fcffc7b432be2baed9d753d"
+  end
+
+  resource "sentencepiece" do
+    url "https://files.pythonhosted.org/packages/cc/33/ea3cb3839607eb175da835244a798f797f478c5ddf0e8ecdf57ea85a4c70/sentencepiece-0.2.2.tar.gz"
+    sha256 "3d2b5e824b5622038dc7b490897efe05ebbbb9e7350fc142f3ecc8789ef9bdf6"
   end
 
   resource "shellingham" do
@@ -139,9 +178,19 @@ class Dwell < Formula
     sha256 "d4e3ac5e546444960c710297a3c9fc3f7ebae1b7e963f3d36173b49da535be9b"
   end
 
+  resource "tokenizers" do
+    url "https://files.pythonhosted.org/packages/73/6f/f80cfef4a312e1fb34baf7d85c72d4411afde10978d4657f8cdd811d3ccc/tokenizers-0.22.2.tar.gz"
+    sha256 "473b83b915e547aa366d1eee11806deaf419e17be16310ac0a14077f1e28f917"
+  end
+
   resource "tqdm" do
     url "https://files.pythonhosted.org/packages/21/3b/6c24bec5be5e743ffd99576daa5cc077722fc7d5bbc00bd133fa0c698dc6/tqdm-4.70.0.tar.gz"
     sha256 "55b0b0dbd97462d06ebee91e4dac24ed4d4702be82b24f07e6c1d27e08cea220"
+  end
+
+  resource "transformers" do
+    url "https://files.pythonhosted.org/packages/2a/92/c50c61da7046bbb59a4d011291aeadcfb4d7980ab36fdb31e93823a3fb93/transformers-5.15.1.tar.gz"
+    sha256 "27c996bd9075ddc82d40f8590dfdc81ea45f611bfca477e0db5d7fd257a482f7"
   end
 
   resource "typer" do
@@ -165,6 +214,9 @@ class Dwell < Formula
   end
 
   def install
+    # tokenizers, safetensors, and hf-xet build PyO3 extensions through maturin.
+    ENV.append_to_rustflags "-C link-arg=-Wl,-undefined,dynamic_lookup"
+
     venv = virtualenv_install_with_resources(without: "hf-xet")
 
     resource("hf-xet").stage do
@@ -183,7 +235,12 @@ class Dwell < Formula
     ENV["TRANSFORMERS_OFFLINE"] = "1"
 
     assert_match "Dwell #{version}", shell_output("#{bin}/dwell --version")
+    assert_equal "0.31.3", shell_output(
+      "#{libexec}/bin/python -c \"import importlib.metadata; print(importlib.metadata.version('mlx-lm'))\"",
+    ).strip
+    system libexec/"bin/python", "-c", "import mlx_lm.server"
     assert_match (testpath/".dwell").to_s, shell_output("#{bin}/dwell config show")
     assert_match "ltx-2.5-bf16", shell_output("#{bin}/dwell models list")
+    assert_match "qwen3-coder-30b-a3b-4bit", shell_output("#{bin}/dwell models list")
   end
 end

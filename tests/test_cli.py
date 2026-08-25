@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 from typer.testing import CliRunner
 
+from dwell import cli as cli_module
 from dwell.cli import app
 from dwell.setup import SetupMode, SetupReport
 
@@ -54,13 +57,14 @@ def test_config_status_jobs_and_outputs_without_server(tmp_path: Path) -> None:
     assert "No outputs" in result.stdout
 
 
-def test_model_list_info_and_unconfigured_q8_dry_run_are_offline(tmp_path: Path) -> None:
+def test_model_list_info_and_install_dry_runs_are_offline(tmp_path: Path) -> None:
     env = _env(tmp_path / "dwell")
 
     result = runner.invoke(app, ["models", "list"], env=env)
     assert result.exit_code == 0, result.output
     assert "ltx-2.5-bf16" in result.stdout
     assert "ltx-2.5-q8" in result.stdout
+    assert "qwen3-coder-30b-a3b-4bit" in result.stdout
     assert "no" in result.stdout
 
     result = runner.invoke(app, ["models", "info", "ltx-2.5-q8"], env=env)
@@ -75,6 +79,18 @@ def test_model_list_info_and_unconfigured_q8_dry_run_are_offline(tmp_path: Path)
     )
     assert result.exit_code == 0, result.output
     assert "Source: not configured" in result.stdout
+    assert "no download was performed" in result.stdout
+
+    result = runner.invoke(
+        app,
+        ["models", "install", "qwen3-coder-30b-a3b-4bit", "--dry-run"],
+        env=env,
+    )
+    assert result.exit_code == 0, result.output
+    assert "Source: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit" in result.stdout
+    assert "Revision: 6e302ea604ad9ab206367e2c501d1571023e7b6d" in result.stdout
+    assert "Approximate size: 17.2 GB" in result.stdout
+    assert "Downloadable: yes" in result.stdout
     assert "no download was performed" in result.stdout
     assert not (tmp_path / "dwell").exists()
 
@@ -140,3 +156,63 @@ def test_missing_model_error_is_concise(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert "not registered" in result.output
     assert "Traceback" not in result.output
+
+
+def test_persistent_model_load_and_unload_are_owned_by_running_daemon(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    model_id = "qwen3-coder-30b-a3b-4bit"
+    definition = SimpleNamespace(
+        capabilities=SimpleNamespace(persistent_loading=True),
+    )
+    manager = SimpleNamespace(
+        registry=SimpleNamespace(get=lambda requested: definition),
+    )
+    requests: list[tuple[str, str]] = []
+
+    def fake_api_request(
+        _config,
+        path: str,
+        *,
+        method: str = "GET",
+        timeout: float = 10,
+        **_kwargs: Any,
+    ) -> dict[str, Any]:
+        del timeout
+        requests.append((method, path))
+        return {
+            "id": model_id,
+            "family": "qwen3-coder",
+            "version": "test",
+            "modality": "text",
+            "runtime": "mlx-lm",
+            "quantization": "4bit",
+            "registered": True,
+            "installed": True,
+            "available": True,
+            "loaded": True,
+            "state": "loaded",
+            "partial": False,
+            "cache_path": str(tmp_path / "snapshot"),
+        }
+
+    monkeypatch.setattr(cli_module, "_model_manager", lambda _config: manager)
+    monkeypatch.setattr(
+        cli_module,
+        "server_status",
+        lambda _config: {"running": True, "api_status": {"server": "running"}},
+    )
+    monkeypatch.setattr(cli_module, "api_request", fake_api_request)
+    env = _env(tmp_path / "dwell")
+
+    loaded = runner.invoke(app, ["models", "load", model_id], env=env)
+    unloaded = runner.invoke(app, ["models", "unload", model_id], env=env)
+
+    assert loaded.exit_code == 0, loaded.output
+    assert f"Model loaded: {model_id}" in loaded.stdout
+    assert unloaded.exit_code == 0, unloaded.output
+    assert requests == [
+        ("POST", f"/v1/models/{model_id}/load"),
+        ("DELETE", f"/v1/models/{model_id}/load"),
+    ]

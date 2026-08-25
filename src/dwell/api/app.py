@@ -15,7 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from dwell import __version__
 from dwell.config import DwellConfig
-from dwell.domain import JobRecord, JobStatus, Modality, VideoGenerationRequest
+from dwell.domain import JobRecord, JobStatus, Modality, ModelView, VideoGenerationRequest
 from dwell.errors import DwellError
 from dwell.jobs import JobManager, JobStore
 from dwell.logging_config import configure_logging
@@ -110,6 +110,10 @@ def create_app(
     application.state.job_store = store
     application.state.job_manager = jobs
 
+    from dwell.api.openai import create_openai_router
+
+    application.include_router(create_openai_router(manager))
+
     @application.exception_handler(DwellError)
     async def dwell_error_handler(_request: Request, exc: DwellError) -> JSONResponse:
         return JSONResponse(status_code=exc.status_code, content=jsonable_encoder(exc.as_dict()))
@@ -172,6 +176,18 @@ def create_app(
         return {
             "data": [model.model_dump(mode="json") for model in manager.list_models()],
         }
+
+    @application.post("/v1/models/{model_id}/load", response_model=ModelView)
+    async def load_model(model_id: str) -> ModelView:
+        return await manager.load(model_id)
+
+    @application.delete("/v1/models/{model_id}/load", response_model=ModelView)
+    async def unload_model(model_id: str) -> ModelView:
+        return await manager.unload(model_id)
+
+    @application.delete("/v1/models", response_model=list[ModelView])
+    async def unload_all_models() -> list[ModelView]:
+        return await manager.unload_all()
 
     @application.post(
         "/v1/videos",

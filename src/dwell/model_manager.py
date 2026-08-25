@@ -22,6 +22,7 @@ from dwell.domain import (
 )
 from dwell.errors import DwellError, model_not_installed
 from dwell.registry import ModelRegistry
+from dwell.runtimes.base import TextEngine, TextStream
 from dwell.runtimes.registry import RuntimeRegistry
 
 logger = logging.getLogger(__name__)
@@ -332,7 +333,13 @@ class ModelManager:
         definition = self.registry.get(model_id)
         runtime = self.runtimes.get(definition.runtime)
         model_path = self.resolve_local_path(model_id)
-        await runtime.prepare(definition, model_path)
+        await self.runtimes.acquire_inference(wait=False)
+        try:
+            released = await self.runtimes.release_resident_except(definition.runtime)
+            self._loaded.difference_update(released)
+            await runtime.prepare(definition, model_path)
+        finally:
+            await self.runtimes.release_inference()
         if runtime.capabilities.persistent_loading:
             self._loaded.add(model_id)
             logger.info("Loaded model %s", model_id)
@@ -344,16 +351,22 @@ class ModelManager:
         definition = self.registry.get(model_id)
         runtime = self.runtimes.get(definition.runtime)
         if runtime.capabilities.persistent_loading and model_id in self._loaded:
-            await runtime.release(definition)
+            await self.runtimes.acquire_inference(wait=False)
+            try:
+                await runtime.release(definition)
+            finally:
+                await self.runtimes.release_inference()
             self._loaded.discard(model_id)
             logger.info("Unloaded model %s", model_id)
         return self.get_model(model_id)
 
     async def unload_all(self) -> list[ModelView]:
-        for model_id in list(self._loaded):
-            await self.unload(model_id)
-        await self.runtimes.release_all()
-        self._loaded.clear()
+        await self.runtimes.acquire_inference(wait=False)
+        try:
+            await self.runtimes.release_all()
+            self._loaded.clear()
+        finally:
+            await self.runtimes.release_inference()
         return self.list_models()
 
     async def generate_video(
@@ -371,7 +384,65 @@ class ModelManager:
             )
         definition = self.registry.get(request.model)
         engine = self.runtimes.video_engine(definition)
-        return await engine.generate(request, job_id, cancel_event)
+        await self.runtimes.acquire_inference(wait=True)
+        try:
+            released = await self.runtimes.release_resident_except(definition.runtime)
+            self._loaded.difference_update(released)
+            return await engine.generate(request, job_id, cancel_event)
+        finally:
+            await self.runtimes.release_inference()
+
+    def _text_engine(self, model_id: str) -> tuple[ModelDefinition, TextEngine]:
+        view = self.ensure_installed(model_id)
+        if view.modality != Modality.TEXT:
+            raise DwellError(
+                "invalid_request",
+                f"Model '{model_id}' does not support text generation.",
+                status_code=422,
+            )
+        if not view.available:
+            raise DwellError(
+                "runtime_not_available",
+                f"Runtime '{view.runtime}' is not available locally.",
+                status_code=503,
+            )
+        definition = self.registry.get(model_id)
+        return definition, self.runtimes.text_engine(definition)
+
+    async def complete_text(
+        self,
+        model_id: str,
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        definition, engine = self._text_engine(model_id)
+        await self.runtimes.acquire_inference(wait=False)
+        try:
+            released = await self.runtimes.release_resident_except(definition.runtime)
+            self._loaded.difference_update(released)
+            result = await engine.complete(definition, payload)
+            if engine.capabilities.persistent_loading:
+                self._loaded.add(model_id)
+            return result
+        finally:
+            await self.runtimes.release_inference()
+
+    async def open_text_stream(
+        self,
+        model_id: str,
+        payload: dict[str, Any],
+    ) -> TextStream:
+        definition, engine = self._text_engine(model_id)
+        await self.runtimes.acquire_inference(wait=False)
+        try:
+            released = await self.runtimes.release_resident_except(definition.runtime)
+            self._loaded.difference_update(released)
+            stream = await engine.open_stream(definition, payload)
+        except BaseException:
+            await self.runtimes.release_inference()
+            raise
+        if engine.capabilities.persistent_loading:
+            self._loaded.add(model_id)
+        return TextStream(stream, self.runtimes.release_inference)
 
     async def cancel(self, job_id: str) -> bool:
         cancelled = False
@@ -383,3 +454,4 @@ class ModelManager:
 
     async def shutdown(self) -> None:
         await self.runtimes.release_all()
+        self._loaded.clear()

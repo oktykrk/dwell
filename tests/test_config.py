@@ -17,6 +17,7 @@ def test_defaults_derive_from_home(tmp_path: Path) -> None:
     config = DwellConfig(home=tmp_path)
 
     assert config.api_url == "http://127.0.0.1:8188"
+    assert config.mlx_lm_url == "http://127.0.0.1:8189"
     assert config.models_dir == tmp_path / "models"
     assert config.hf_home == tmp_path / "models" / "huggingface"
     assert config.hf_hub_cache == tmp_path / "models" / "huggingface" / "hub"
@@ -35,11 +36,17 @@ def test_config_from_env(tmp_path: Path) -> None:
 
     assert config.home == tmp_path
     assert config.port == 19188
+    assert config.mlx_lm_port == 19189
 
 
 def test_non_loopback_binding_is_rejected(tmp_path: Path) -> None:
     with pytest.raises(ValidationError, match="only bind to 127.0.0.1"):
         DwellConfig(home=tmp_path, host="0.0.0.0")
+
+
+def test_internal_runtime_port_must_differ_from_api_port(tmp_path: Path) -> None:
+    with pytest.raises(ValidationError, match="must differ"):
+        DwellConfig(home=tmp_path, port=8188, mlx_lm_port=8188)
 
 
 @pytest.mark.parametrize("unsafe_home", ["", ".", "/"])
@@ -74,3 +81,4 @@ def test_layout_and_offline_subprocess_environment(tmp_path: Path) -> None:
     assert "PYTHONPATH" not in env
     assert "UV_PROJECT_ENVIRONMENT" not in env
     assert "VIRTUAL_ENV" not in env
+    assert env["DWELL_MLX_LM_PORT"] == "8189"

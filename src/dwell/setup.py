@@ -687,6 +687,17 @@ class SetupManager:
                 "unsupported_platform",
                 f"Dwell setup requires macOS on Apple Silicon; detected {system} {machine}.",
             )
+        macos_version = platform.mac_ver()[0]
+        try:
+            macos_major = int(macos_version.split(".", 1)[0])
+        except (TypeError, ValueError):
+            macos_major = 0
+        if macos_major < 14:
+            raise DwellError(
+                "unsupported_platform",
+                "Dwell setup requires macOS 14 Sonoma or newer on Apple Silicon; "
+                f"detected macOS {macos_version or 'unknown'}.",
+            )
         unavailable: dict[str, str] = {}
         for name, version_arguments in _TOOL_VERSION_ARGUMENTS.items():
             executable = shutil.which(name)
@@ -710,7 +721,7 @@ class SetupManager:
                 details={"unavailable": unavailable},
             )
 
-        messages = ["Platform: macOS arm64", "Tools: uv, git, ffmpeg, ffprobe"]
+        messages = ["Platform: macOS 14+ arm64", "Tools: uv, git, ffmpeg, ffprobe"]
         memory = self._physical_memory_gib()
         if memory is None:
             messages.append("Memory: unable to determine unified-memory capacity")
