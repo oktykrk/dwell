@@ -168,8 +168,7 @@ jobs:
           "$smoke_venv/bin/python" -c \
             "import importlib.metadata; import mlx_lm.server; assert importlib.metadata.version('mlx-lm') == '0.31.3'"
 
-      - name: Prepare immutable Homebrew formula
-        id: formula
+      - name: Prepare Homebrew source formula
         shell: bash
         run: |
           set -euo pipefail
@@ -204,6 +203,14 @@ jobs:
               raise SystemExit(
                   f"expected one Dwell formula source block, found {replacements}"
               )
+
+          bottle_pattern = re.compile(r"(?ms)^  bottle do\n.*?^  end\n\n")
+          bottle_blocks = bottle_pattern.findall(updated)
+          if len(bottle_blocks) > 1:
+              raise SystemExit(
+                  f"expected at most one Homebrew bottle block, found {len(bottle_blocks)}"
+              )
+          updated = bottle_pattern.sub("", updated)
           formula.write_text(updated, encoding="utf-8")
           PY
 
@@ -211,25 +218,14 @@ jobs:
           git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
           git diff -- Formula/dwell.rb
 
-          if test "$RELEASE_MODE" = "resume"; then
-            current_formula="$RUNNER_TEMP/current-dwell.rb"
-            git show "$DISPATCH_SHA:Formula/dwell.rb" > "$current_formula"
-            cmp Formula/dwell.rb "$current_formula" || {
-              echo "The current Formula differs from the formula derived from $RELEASE_TAG." >&2
-              exit 1
-            }
-          fi
-
           git switch --create release-formula
           git add Formula/dwell.rb
           test "$(git diff --cached --name-only)" = "Formula/dwell.rb"
-          git commit -m "Update Homebrew formula for $RELEASE_TAG"
+          git commit -m "Prepare Homebrew formula for $RELEASE_TAG"
           test "$(git rev-parse HEAD^)" = "$RELEASE_SHA"
 
-          digest=$(shasum -a 256 Formula/dwell.rb | awk '{print $1}')
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-
-      - name: Validate Homebrew formula
+      - name: Build and validate Homebrew bottle
+        id: formula
         shell: bash
         run: |
           set -euo pipefail
@@ -246,7 +242,7 @@ jobs:
           brew style Formula/dwell.rb
           brew tap oktykrk/dwell "$GITHUB_WORKSPACE"
           brew audit --strict oktykrk/dwell/dwell
-          brew install --build-from-source oktykrk/dwell/dwell
+          brew install --build-bottle oktykrk/dwell/dwell
           brew test oktykrk/dwell/dwell
 
           smoke_home="$RUNNER_TEMP/dwell-homebrew-home"
@@ -256,6 +252,59 @@ jobs:
           DWELL_HOME="$smoke_home" dwell models list | grep -F "qwen3-coder-30b-a3b-4bit"
           "$(brew --prefix dwell)/libexec/bin/python" -c \
             "import importlib.metadata; import mlx_lm.server; assert importlib.metadata.version('mlx-lm') == '0.31.3'"
+
+          bottle_root_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG"
+          brew bottle --json --no-rebuild \
+            --root-url="$bottle_root_url" \
+            --root-url-using=DwellGitHubReleaseDownloadStrategy \
+            oktykrk/dwell/dwell
+
+          shopt -s nullglob
+          bottle_jsons=(dwell--*.bottle.json)
+          bottle_files=(dwell--*.bottle.tar.gz)
+          test "${#bottle_jsons[@]}" -eq 1
+          test "${#bottle_files[@]}" -eq 1
+          bottle_json="${bottle_jsons[0]}"
+          bottle_file="${bottle_files[0]}"
+          expected_filename=$(jq -r \
+            'to_entries[0].value.bottle.tags | to_entries[0].value.local_filename' \
+            "$bottle_json")
+          test "$(basename "$bottle_file")" = "$expected_filename"
+
+          brew bottle --merge --write --no-commit \
+            --root-url-using=DwellGitHubReleaseDownloadStrategy \
+            "$bottle_json"
+          tap_formula="$(brew --repository oktykrk/dwell)/Formula/dwell.rb"
+          test -f "$tap_formula"
+          cp "$tap_formula" Formula/dwell.rb
+
+          bottle_sha=$(shasum -a 256 "$bottle_file" | awk '{print $1}')
+          grep -F "root_url \"$bottle_root_url\"" Formula/dwell.rb
+          grep -F "$bottle_sha" Formula/dwell.rb
+          brew style Formula/dwell.rb
+          brew audit --strict oktykrk/dwell/dwell
+
+          if test "$RELEASE_MODE" = "resume"; then
+            current_formula="$RUNNER_TEMP/current-dwell.rb"
+            git show "$DISPATCH_SHA:Formula/dwell.rb" > "$current_formula"
+            cmp Formula/dwell.rb "$current_formula" || {
+              echo "The current Formula differs from the rebuilt $RELEASE_TAG bottle." >&2
+              exit 1
+            }
+          fi
+
+          git diff --check
+          git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
+          test "$(git diff --name-only)" = "Formula/dwell.rb"
+          git add Formula/dwell.rb
+          git commit --amend -m "Update Homebrew formula for $RELEASE_TAG"
+          test "$(git rev-parse HEAD^)" = "$RELEASE_SHA"
+
+          mkdir -p dist/homebrew
+          mv "$bottle_json" "$bottle_file" dist/homebrew/
+
+          digest=$(shasum -a 256 Formula/dwell.rb | awk '{print $1}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
 
       - name: Save validated release inputs
         if: inputs.publish
@@ -268,12 +317,13 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.whl
+            dist/homebrew/*.bottle.*
             Formula/dwell.rb
 
       - name: Summarize validation-only run
         if: ${{ !inputs.publish }}
         run: |
-          echo "Release $RELEASE_TAG passed project, package, and Homebrew validation."
+          echo "Release $RELEASE_TAG passed project, package, Homebrew, and bottle validation."
           echo "Nothing was pushed because publish was not selected."
 
   publish:
@@ -313,6 +363,15 @@ jobs:
           release_formula="$RUNNER_TEMP/release-source-dwell.rb"
           test -f "$validated_formula"
           test "$(sha256sum "$validated_formula" | awk '{print $1}')" = "$FORMULA_DIGEST"
+
+          shopt -s nullglob
+          bottle_files=("$RUNNER_TEMP"/dwell-release/dist/homebrew/*.bottle.tar.gz)
+          bottle_jsons=("$RUNNER_TEMP"/dwell-release/dist/homebrew/*.bottle.json)
+          test "${#bottle_files[@]}" -eq 1
+          test "${#bottle_jsons[@]}" -eq 1
+          bottle_sha=$(sha256sum "${bottle_files[0]}" | awk '{print $1}')
+          grep -F "$bottle_sha" "$validated_formula"
+
           test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"
           git show "$RELEASE_SHA:Formula/dwell.rb" > "$release_formula"
           release_formula_digest=$(sha256sum "$release_formula" | awk '{print $1}')
@@ -429,13 +488,18 @@ jobs:
           fi
 
           is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft)
+          mapfile -t release_assets < <(
+            find "$RUNNER_TEMP/dwell-release/dist" -type f \
+              \( -name '*.whl' -o -name '*.tar.gz' \) -print | sort
+          )
+          test "${#release_assets[@]}" -eq 3
           if test "$is_draft" = "true"; then
-            gh release upload "$RELEASE_TAG" "$RUNNER_TEMP"/dwell-release/dist/* --clobber
+            gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
           fi
 
           release_json="$RUNNER_TEMP/release.json"
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
-          for artifact in "$RUNNER_TEMP"/dwell-release/dist/*; do
+          for artifact in "${release_assets[@]}"; do
             asset_name=$(basename "$artifact")
             expected_digest="sha256:$(sha256sum "$artifact" | awk '{print $1}')"
             actual_digest=$(jq -r --arg name "$asset_name" \

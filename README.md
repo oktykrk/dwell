@@ -57,6 +57,7 @@ authenticate to GitHub. Then install Dwell on an Apple Silicon Mac running macOS
 newer, without cloning the repository manually:
 
 ```bash
+export HOMEBREW_GITHUB_API_TOKEN="$(gh auth token)"
 brew tap oktykrk/dwell git@github.com:oktykrk/dwell.git
 brew install dwell
 dwell setup
@@ -66,10 +67,12 @@ dwell status
 ```
 
 `brew install` installs the Dwell CLI, the pinned MLX-LM text runtime, and its system dependencies
-in Homebrew's managed prefix. `dwell setup` prepares the separate per-user LTX video runtime under
-`~/.dwell`; it does not download model weights, start the server, or edit `.zshrc` or any other
-shell configuration. Model weights are downloaded only by the explicit
-`dwell models install …` command.
+in Homebrew's managed prefix. Published releases include a prebuilt Apple Silicon bottle for macOS
+15 and newer. `HOMEBREW_GITHUB_API_TOKEN` lets Homebrew authenticate when it downloads that bottle
+from this private repository; a fine-grained token with read access to the repository is enough.
+`dwell setup` prepares the separate per-user LTX video runtime under `~/.dwell`; it does not
+download model weights, start the server, or edit `.zshrc` or any other shell configuration. Model
+weights are downloaded only by the explicit `dwell models install …` command.
 
 ### Updating a Homebrew installation
 
