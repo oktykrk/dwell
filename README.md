@@ -342,10 +342,12 @@ workflow, choose **Run workflow** from `main`, enter the version already recorde
 `pyproject.toml`, and select **publish**. Leaving **publish** unselected performs the complete
 project, package, and Homebrew validation without changing the remote repository.
 
-A publishing run validates the immutable `v<version>` tag and the matching
-`Formula/dwell.rb` update, pushes that tag and Formula commit atomically, and then creates the
-GitHub Release. A concurrent change to `main` therefore leaves neither Git ref partially
-published. Normal CI continues to validate development commits and pull requests, but it does not
-publish them. If GitHub Release creation is interrupted after the refs land, run the same version
-again from the new `main`; the workflow verifies the existing refs and resumes the incomplete
-release.
+For a new version, a publishing run captures the selected `main` commit as the immutable release
+source, validates the matching `v<version>` tag and `Formula/dwell.rb` update, and then creates the
+GitHub Release.
+Commits that reach `main` while validation is running are preserved: the tag remains on the
+captured source commit and the Formula update is added to the latest compatible `main`, with both
+refs pushed atomically. A concurrent Formula change is never overwritten. Normal CI continues to
+validate development commits and pull requests, but it does not publish them. If GitHub Release
+creation is interrupted after the refs land, run the same version again from the new `main`; the
+workflow verifies the existing refs and resumes the incomplete release.

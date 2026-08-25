@@ -27,8 +27,8 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 120
     outputs:
+      dispatch_sha: ${{ steps.release.outputs.dispatch_sha }}
       formula_digest: ${{ steps.formula.outputs.digest }}
-      main_sha: ${{ steps.release.outputs.main_sha }}
       mode: ${{ steps.release.outputs.mode }}
       release_sha: ${{ steps.release.outputs.release_sha }}
       release_tag: ${{ steps.release.outputs.release_tag }}
@@ -63,12 +63,8 @@ jobs:
             exit 1
           }
 
-          main_sha=$(git rev-parse HEAD)
-          test "$main_sha" = "$GITHUB_SHA"
-          test "$(git rev-parse refs/remotes/origin/main)" = "$main_sha" || {
-            echo "main moved after this run was dispatched; start a new release run." >&2
-            exit 1
-          }
+          dispatch_sha=$(git rev-parse HEAD)
+          test "$dispatch_sha" = "$GITHUB_SHA"
 
           release_tag="v$RELEASE_VERSION"
           tag_ref="refs/tags/$release_tag"
@@ -79,11 +75,15 @@ jobs:
               exit 1
             }
             release_sha=$(git rev-list -n 1 "$tag_ref")
+            git merge-base --is-ancestor "$release_sha" "$dispatch_sha" || {
+              echo "Existing $release_tag is not in the selected main history." >&2
+              exit 1
+            }
             mode="resume"
 
-            formula_tag=$(git show "$main_sha:Formula/dwell.rb" \
+            formula_tag=$(git show "$dispatch_sha:Formula/dwell.rb" \
               | sed -n 's/^      tag: *"\([^"]*\)",$/\1/p')
-            formula_revision=$(git show "$main_sha:Formula/dwell.rb" \
+            formula_revision=$(git show "$dispatch_sha:Formula/dwell.rb" \
               | sed -n 's/^      revision: *"\([0-9a-f]*\)"$/\1/p')
             test "$formula_tag" = "$release_tag" || {
               echo "Existing tag $release_tag is not the release currently recorded by Formula/dwell.rb." >&2
@@ -94,7 +94,7 @@ jobs:
               exit 1
             }
           else
-            release_sha="$main_sha"
+            release_sha="$dispatch_sha"
             mode="new"
           fi
 
@@ -107,11 +107,11 @@ jobs:
             exit 1
           }
 
-          echo "MAIN_SHA=$main_sha" >> "$GITHUB_ENV"
+          echo "DISPATCH_SHA=$dispatch_sha" >> "$GITHUB_ENV"
           echo "RELEASE_MODE=$mode" >> "$GITHUB_ENV"
           echo "RELEASE_SHA=$release_sha" >> "$GITHUB_ENV"
           echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
-          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
+          echo "dispatch_sha=$dispatch_sha" >> "$GITHUB_OUTPUT"
           echo "mode=$mode" >> "$GITHUB_OUTPUT"
           echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
@@ -206,7 +206,7 @@ jobs:
 
           if test "$RELEASE_MODE" = "resume"; then
             current_formula="$RUNNER_TEMP/current-dwell.rb"
-            git show "$MAIN_SHA:Formula/dwell.rb" > "$current_formula"
+            git show "$DISPATCH_SHA:Formula/dwell.rb" > "$current_formula"
             cmp Formula/dwell.rb "$current_formula" || {
               echo "The current Formula differs from the formula derived from $RELEASE_TAG." >&2
               exit 1
@@ -274,8 +274,8 @@ jobs:
     permissions:
       contents: write
     env:
+      DISPATCH_SHA: ${{ needs.validate.outputs.dispatch_sha }}
       FORMULA_DIGEST: ${{ needs.validate.outputs.formula_digest }}
-      MAIN_SHA: ${{ needs.validate.outputs.main_sha }}
       RELEASE_MODE: ${{ needs.validate.outputs.mode }}
       RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
@@ -285,7 +285,7 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
-          ref: ${{ needs.validate.outputs.main_sha }}
+          ref: ${{ needs.validate.outputs.dispatch_sha }}
 
       - name: Download validated release inputs
         uses: actions/download-artifact@v8.0.1
@@ -300,65 +300,106 @@ jobs:
           set -euo pipefail
 
           validated_formula="$RUNNER_TEMP/dwell-release/Formula/dwell.rb"
+          release_formula="$RUNNER_TEMP/release-source-dwell.rb"
           test -f "$validated_formula"
           test "$(sha256sum "$validated_formula" | awk '{print $1}')" = "$FORMULA_DIGEST"
-          test "$(git rev-parse HEAD)" = "$MAIN_SHA"
-
-          git fetch --tags origin \
-            "+refs/heads/main:refs/remotes/origin/main"
-          remote_main=$(git rev-parse refs/remotes/origin/main)
+          test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"
+          git show "$RELEASE_SHA:Formula/dwell.rb" > "$release_formula"
+          release_formula_digest=$(sha256sum "$release_formula" | awk '{print $1}')
           tag_ref="refs/tags/$RELEASE_TAG"
 
-          tag_matches_release() {
-            git show-ref --verify --quiet "$tag_ref" \
-              && test "$(git cat-file -t "$tag_ref")" = "tag" \
-              && test "$(git rev-list -n 1 "$tag_ref")" = "$RELEASE_SHA"
-          }
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if ! git show-ref --verify --quiet "$tag_ref"; then
+            test "$RELEASE_MODE" = "new" || {
+              echo "The existing release tag disappeared after validation." >&2
+              exit 1
+            }
+            git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Dwell $RELEASE_TAG"
+          fi
+          test "$(git cat-file -t "$tag_ref")" = "tag"
+          test "$(git rev-list -n 1 "$tag_ref")" = "$RELEASE_SHA"
 
-          remote_formula_matches() {
-            test "$(git show "$1:Formula/dwell.rb" | sha256sum | awk '{print $1}')" \
-              = "$FORMULA_DIGEST"
-          }
+          refs_ready="false"
+          failed_main=""
+          for attempt in 1 2 3 4 5; do
+            git fetch origin \
+              "+refs/heads/main:refs/remotes/origin/main"
+            remote_main=$(git rev-parse refs/remotes/origin/main)
+            git merge-base --is-ancestor "$RELEASE_SHA" "$DISPATCH_SHA" || {
+              echo "The release tag is not in the selected main history." >&2
+              exit 1
+            }
+            git merge-base --is-ancestor "$DISPATCH_SHA" "$remote_main" || {
+              echo "The selected release commit is no longer in main history." >&2
+              exit 1
+            }
 
-          if test "$RELEASE_MODE" = "new" \
-            && test "$remote_main" = "$MAIN_SHA" \
-            && ! git show-ref --verify --quiet "$tag_ref"; then
+            remote_refs=$(git ls-remote --tags origin \
+              "refs/tags/$RELEASE_TAG" "refs/tags/$RELEASE_TAG^{}")
+            remote_tag=$(printf '%s\n' "$remote_refs" \
+              | awk -v ref="refs/tags/$RELEASE_TAG" '$2 == ref { print $1 }')
+            remote_revision=$(printf '%s\n' "$remote_refs" \
+              | awk -v ref="refs/tags/$RELEASE_TAG^{}" '$2 == ref { print $1 }')
+            remote_formula_digest=$(git show "$remote_main:Formula/dwell.rb" \
+              | sha256sum | awk '{print $1}')
+
+            if test -n "$remote_tag"; then
+              test -n "$remote_revision" || {
+                echo "Remote $RELEASE_TAG is not an annotated tag." >&2
+                exit 1
+              }
+              test "$remote_revision" = "$RELEASE_SHA" || {
+                echo "Remote $RELEASE_TAG points to a different commit." >&2
+                exit 1
+              }
+              test "$remote_formula_digest" = "$FORMULA_DIGEST" || {
+                echo "Remote Formula/dwell.rb does not match $RELEASE_TAG." >&2
+                exit 1
+              }
+
+              formula_sha=$(git log -1 --format=%H "$remote_main" -- Formula/dwell.rb)
+              test -n "$formula_sha"
+              refs_ready="true"
+              break
+            fi
+
+            test "$RELEASE_MODE" = "new" || {
+              echo "Remote $RELEASE_TAG disappeared after validation." >&2
+              exit 1
+            }
+            test "$remote_formula_digest" = "$release_formula_digest" || {
+              echo "Formula/dwell.rb changed after the release was dispatched." >&2
+              exit 1
+            }
+            test "$remote_main" != "$failed_main" || {
+              echo "Publishing refs failed without a concurrent main update." >&2
+              exit 1
+            }
+
+            git switch --force-create release-formula "$remote_main"
             cp "$validated_formula" Formula/dwell.rb
             git diff --check
             git diff --exit-code -- . ':(exclude)Formula/dwell.rb'
-
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git tag -a "$RELEASE_TAG" "$RELEASE_SHA" -m "Dwell $RELEASE_TAG"
-            git switch --create release-formula
+            test "$(git diff --name-only)" = "Formula/dwell.rb"
             git add Formula/dwell.rb
-            test "$(git diff --cached --name-only)" = "Formula/dwell.rb"
             git commit -m "Update Homebrew formula for $RELEASE_TAG"
-            test "$(git rev-parse HEAD^)" = "$RELEASE_SHA"
+            test "$(git rev-parse HEAD^)" = "$remote_main"
 
-            git push --atomic \
-              --force-with-lease="refs/heads/main:$MAIN_SHA" \
-              origin \
+            if git push --atomic origin \
               "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG" \
-              "HEAD:refs/heads/main"
-            formula_sha=$(git rev-parse HEAD)
-          elif test "$RELEASE_MODE" = "new" \
-            && tag_matches_release \
-            && remote_formula_matches "$remote_main" \
-            && test "$(git rev-parse "${remote_main}^")" = "$RELEASE_SHA" \
-            && test "$(git diff --name-only "$RELEASE_SHA" "$remote_main")" \
-              = "Formula/dwell.rb"; then
-            # A retry after refs were pushed but before the GitHub Release completed.
-            formula_sha="$remote_main"
-          elif test "$RELEASE_MODE" = "resume" \
-            && test "$remote_main" = "$MAIN_SHA" \
-            && tag_matches_release \
-            && remote_formula_matches "$remote_main"; then
-            formula_sha="$remote_main"
-          else
-            echo "Remote release state changed after validation; nothing was published." >&2
+              "HEAD:refs/heads/main"; then
+              formula_sha=$(git rev-parse HEAD)
+              refs_ready="true"
+              break
+            fi
+            failed_main="$remote_main"
+          done
+
+          test "$refs_ready" = "true" || {
+            echo "main kept changing while the release was being published." >&2
             exit 1
-          fi
+          }
 
           echo "formula_sha=$formula_sha" >> "$GITHUB_OUTPUT"
 
