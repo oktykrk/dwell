@@ -58,16 +58,16 @@ uv sync
 uv run dwell --help
 ```
 
-The operational home defaults to `~/dwell`. Source code may live elsewhere; caches, runtimes,
+The operational home defaults to `~/.dwell`. Source code may live elsewhere; caches, runtimes,
 state, logs, temporary artifacts, and outputs remain under the operational home.
 
 To make the command available in a shell, install the project or link the generated environment
-entry point into `~/dwell/bin`, then ensure that directory is on `PATH`.
+entry point into `~/.dwell/bin`, then ensure that directory is on `PATH`.
 
 ## Directory layout
 
 ```text
-~/dwell/
+~/.dwell/
 ├── models/
 │   └── huggingface/       shared HF_HOME (hub cache structure is preserved)
 ├── runtimes/
@@ -95,7 +95,7 @@ from the Dwell source repository.
 Defaults:
 
 ```text
-DWELL_HOME=$HOME/dwell
+DWELL_HOME=$HOME/.dwell
 DWELL_HOST=127.0.0.1
 DWELL_PORT=8188
 ```
@@ -110,7 +110,7 @@ dwell config show
 The shared cache environment is:
 
 ```bash
-export HF_HOME="$HOME/dwell/models/huggingface"
+export HF_HOME="$HOME/.dwell/models/huggingface"
 export HF_HUB_CACHE="$HF_HOME/hub"
 ```
 
@@ -185,7 +185,7 @@ states are `not_installed`, `installed`, `loading`, `loaded`, `unloading`, and `
 The bundled registry records the locally established `mlx-community/ltx-2.5-mlx` bf16 repository.
 It also records `ltx-2.5-q8` as an unconfigured profile because the repository metadata explicitly
 says that no quantized sibling is published. Dwell will not invent a source or silently substitute
-a different model. Set a verified repository in `~/dwell/config/models.json` before attempting a
+a different model. Set a verified repository in `~/.dwell/config/models.json` before attempting a
 real q8 installation.
 
 ## Local API
@@ -232,7 +232,7 @@ If that model is absent, the request performs no install and returns:
 Successful submissions return a queued job ID. Poll `/v1/jobs/{job_id}` for one of `queued`,
 `running`, `completed`, `failed`, or `cancelled`. Progress stays `null` when the underlying runtime
 does not provide a trustworthy value. Video output is written once to
-`~/dwell/outputs/video/<job-id>.mp4`.
+`~/.dwell/outputs/video/<job-id>.mp4`.
 
 Set this in future applications:
 

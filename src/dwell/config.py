@@ -12,7 +12,7 @@ class DwellConfig(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    home: Path = Field(default_factory=lambda: Path.home() / "dwell")
+    home: Path = Field(default_factory=lambda: Path.home() / ".dwell")
     host: str = "127.0.0.1"
     port: int = Field(default=8188, ge=1, le=65535)
 
@@ -41,7 +41,7 @@ class DwellConfig(BaseModel):
     def from_env(cls, env: Mapping[str, str] | None = None) -> DwellConfig:
         values = os.environ if env is None else env
         return cls(
-            home=values.get("DWELL_HOME", str(Path.home() / "dwell")),
+            home=values.get("DWELL_HOME", str(Path.home() / ".dwell")),
             host=values.get("DWELL_HOST", "127.0.0.1"),
             port=int(values.get("DWELL_PORT", "8188")),
         )
