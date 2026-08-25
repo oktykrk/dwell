@@ -20,6 +20,7 @@ def test_defaults_derive_from_home(tmp_path: Path) -> None:
     assert config.models_dir == tmp_path / "models"
     assert config.hf_home == tmp_path / "models" / "huggingface"
     assert config.hf_hub_cache == tmp_path / "models" / "huggingface" / "hub"
+    assert config.hf_xet_cache == tmp_path / "models" / "huggingface" / "xet"
     assert config.jobs_db == tmp_path / "state" / "jobs.sqlite"
 
 
@@ -53,7 +54,23 @@ def test_layout_and_offline_subprocess_environment(tmp_path: Path) -> None:
 
     assert (tmp_path / "outputs" / "video").is_dir()
     assert (tmp_path / "tmp" / "ltx-tests").is_dir()
-    env = config.subprocess_env({"HF_HUB_OFFLINE": "0", "TRANSFORMERS_OFFLINE": "0"})
+    env = config.subprocess_env(
+        {
+            "HF_HUB_OFFLINE": "0",
+            "PYTHONHOME": "/tmp/host-python",
+            "PYTHONPATH": "/tmp/host-modules",
+            "TRANSFORMERS_OFFLINE": "0",
+            "UV_PROJECT_ENVIRONMENT": "/tmp/host-venv",
+            "VIRTUAL_ENV": "/tmp/active-venv",
+        }
+    )
     assert env["HF_HUB_OFFLINE"] == "1"
+    assert env["PYTHONDONTWRITEBYTECODE"] == "1"
     assert env["TRANSFORMERS_OFFLINE"] == "1"
     assert env["HF_HOME"] == str(config.hf_home)
+    assert env["HF_HUB_CACHE"] == str(config.hf_hub_cache)
+    assert env["HF_XET_CACHE"] == str(config.hf_xet_cache)
+    assert "PYTHONHOME" not in env
+    assert "PYTHONPATH" not in env
+    assert "UV_PROJECT_ENVIRONMENT" not in env
+    assert "VIRTUAL_ENV" not in env

@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.11"
+          enable-cache: true
+
+      - name: Install locked development environment
+        run: uv sync --locked --all-groups
+
+      - name: Verify lockfile
+        run: uv lock --check
+
+      - name: Lint
+        run: |
+          UV_OFFLINE=1 uv run ruff check .
+          UV_OFFLINE=1 uv run ruff format --check src tests
+
+      - name: Test
+        run: UV_OFFLINE=1 uv run pytest
+
+      - name: Build wheel and source distribution
+        run: uv build
+
+      - name: Smoke test installed wheel
+        shell: bash
+        run: |
+          smoke_venv="$RUNNER_TEMP/dwell-wheel-smoke"
+          smoke_home="$RUNNER_TEMP/dwell-home"
+          wheel=$(find dist -maxdepth 1 -name '*.whl' -print -quit)
+          test -n "$wheel"
+          test -n "$(find dist -maxdepth 1 -name '*.tar.gz' -print -quit)"
+
+          uv venv "$smoke_venv" --python 3.11
+          uv pip install --python "$smoke_venv/bin/python" "$wheel"
+
+          DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" --version
+          DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" config show | grep -F "$smoke_home"
+          DWELL_HOME="$smoke_home" "$smoke_venv/bin/dwell" models list | grep -F "ltx-2.5-bf16"

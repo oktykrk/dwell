@@ -27,13 +27,16 @@
           "gemma4-12b-ltx-v1/tokenizer_config.json",
           "gemma4-12b-ltx-v1/*.safetensors"
         ],
-        "estimated_size_gb": null,
-        "notes": "Pinned, unquantized bf16 MLX conversion. Completeness is verified for the distilled Dwell adapter, and inference only resolves this exact local snapshot."
+        "estimated_size_gb": 71.0,
+        "license_url": "https://huggingface.co/mlx-community/ltx-2.5-mlx/blob/851cff741ecbd650b7d417af74c3e7b73f76dd64/LICENSE.md",
+        "acceptable_use_url": "https://static.lightricks.com/legal/ltx-acceptable-use-policy.pdf",
+        "notes": "Pinned, unquantized bf16 MLX conversion. The selected distilled runtime files total approximately 71 GB (66.1 GiB); inference resolves only this exact local snapshot."
       },
       "profile": {
         "quantization": "bf16",
-        "disk": null,
-        "memory": "Use the runtime's low-RAM streaming mode on 48 GB systems."
+        "disk": "Approximately 71 GB (66.1 GiB) for the selected distilled files.",
+        "memory": "Allow at least 48 GB unified memory with low-memory scheduling; the upstream measured default peak is 62.4 GB.",
+        "minimum_memory_gb": 48.0
       },
       "runtime_requirements": [
         "macOS on Apple Silicon",
@@ -61,7 +64,9 @@
         "revision": null,
         "required_files": [],
         "estimated_size_gb": null,
-        "notes": "Registered placeholder only. The local LTX-2.5 model README explicitly states that no quantized sibling is published; configure a verified source before installation."
+        "license_url": "https://huggingface.co/mlx-community/ltx-2.5-mlx/blob/851cff741ecbd650b7d417af74c3e7b73f76dd64/LICENSE.md",
+        "acceptable_use_url": "https://static.lightricks.com/legal/ltx-acceptable-use-policy.pdf",
+        "notes": "Registered placeholder only. Dwell has not verified a compatible q8 source, revision, or required-file set; configure and test an explicit source before installation."
       },
       "profile": {
         "quantization": "q8",

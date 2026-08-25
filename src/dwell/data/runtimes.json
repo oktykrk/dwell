@@ -1,0 +1,12 @@
+{
+  "schema_version": 1,
+  "runtimes": [
+    {
+      "id": "ltx-2-mlx",
+      "repository": "https://github.com/xocialize/ltx-2-mlx.git",
+      "branch": "main",
+      "commit": "8ebae0a7cb08312fbf884790b91b4d155e714cdc",
+      "python": "3.11"
+    }
+  ]
+}

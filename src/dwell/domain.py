@@ -65,6 +65,8 @@ class WeightSource(BaseModel):
     revision: str | None = None
     required_files: tuple[str, ...] = ()
     estimated_size_gb: float | None = None
+    license_url: str | None = None
+    acceptable_use_url: str | None = None
     notes: str | None = None
 
 
@@ -74,6 +76,7 @@ class ModelProfile(BaseModel):
     quantization: str | None = None
     disk: str | None = None
     memory: str | None = None
+    minimum_memory_gb: float | None = Field(default=None, gt=0)
 
 
 class ModelDefinition(BaseModel):
