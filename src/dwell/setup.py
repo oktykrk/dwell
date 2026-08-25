@@ -10,17 +10,20 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 import tempfile
+import urllib.parse
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import StrEnum
 from importlib.resources import files
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, TypeAdapter, field_validator
+import httpx
+from pydantic import BaseModel, ConfigDict, TypeAdapter, field_validator, model_validator
 
 from dwell import __version__
 from dwell.config import DwellConfig
@@ -28,14 +31,21 @@ from dwell.doctor import DoctorCheck, has_errors, run_doctor
 from dwell.errors import DwellError
 
 _COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _TOOL_VERSION_ARGUMENTS = {
     "uv": ("--version",),
-    "git": ("--version",),
     "ffmpeg": ("-version",),
     "ffprobe": ("-version",),
 }
 _STRUCTURAL_FILE_LIMIT = 64 * 1024
 _VENV_PROVENANCE_FILE = ".dwell-provenance.json"
+_SOURCE_ARCHIVE_FILE = ".dwell-source.tar.gz"
+_SOURCE_MANIFEST_FILE = ".dwell-source.json"
+_SOURCE_MANIFEST_LIMIT = 2 * 1024 * 1024
+_MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
+_MAX_ARCHIVE_CONTENT_BYTES = 512 * 1024 * 1024
+_MAX_ARCHIVE_ENTRIES = 20_000
+_ARCHIVE_SOURCE_FIELDS = frozenset({"id", "archive_url", "archive_sha256", "commit", "python"})
 
 
 class SetupMode(StrEnum):
@@ -49,15 +59,24 @@ class RuntimeSpec(BaseModel):
     model_config = ConfigDict(frozen=True)
 
     id: str
-    repository: str
-    branch: str
+    repository: str | None = None
+    branch: str | None = None
+    archive_url: str | None = None
+    archive_sha256: str | None = None
     commit: str
     python: str
 
-    @field_validator("id", "repository", "branch", "python")
+    @field_validator("id", "python")
     @classmethod
     def nonempty(cls, value: str) -> str:
         if not value.strip():
+            raise ValueError("must not be empty")
+        return value
+
+    @field_validator("repository", "branch", "archive_url")
+    @classmethod
+    def optional_nonempty(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
             raise ValueError("must not be empty")
         return value
 
@@ -67,6 +86,33 @@ class RuntimeSpec(BaseModel):
         if not _COMMIT_RE.fullmatch(value):
             raise ValueError("must be a full 40-character lowercase Git commit")
         return value
+
+    @field_validator("archive_sha256")
+    @classmethod
+    def immutable_archive(cls, value: str | None) -> str | None:
+        if value is not None and not _SHA256_RE.fullmatch(value):
+            raise ValueError("must be a 64-character lowercase SHA-256")
+        return value
+
+    @model_validator(mode="after")
+    def complete_source(self) -> RuntimeSpec:
+        if (self.repository is None) != (self.branch is None):
+            raise ValueError("repository and branch must be provided together")
+        if (self.archive_url is None) != (self.archive_sha256 is None):
+            raise ValueError("archive_url and archive_sha256 must be provided together")
+        if self.repository is None and self.archive_url is None:
+            raise ValueError("a Git repository or pinned archive must be provided")
+        if self.archive_url is not None:
+            parsed = urllib.parse.urlsplit(self.archive_url)
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise ValueError("archive_url must be an absolute HTTPS URL")
+            if self.commit not in self.archive_url:
+                raise ValueError("archive_url must contain the full pinned commit")
+        return self
+
+    @property
+    def uses_archive(self) -> bool:
+        return self.archive_url is not None
 
 
 _RUNTIME_LIST = TypeAdapter(list[RuntimeSpec])
@@ -78,6 +124,7 @@ class RuntimeInspection:
     source_valid: bool
     remote: str | None
     commit: str | None
+    source_hash: str | None
     dirty: bool
     venv_exists: bool
     venv_healthy: bool
@@ -103,6 +150,7 @@ class MutationOutcome:
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 DoctorRunner = Callable[[DwellConfig], list[DoctorCheck]]
+ArchiveDownloader = Callable[[str, Path, str], None]
 
 
 def _run(
@@ -124,6 +172,64 @@ def _run(
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(command, 127, "", str(exc))
+
+
+def _download_archive(url: str, destination: Path, expected_sha256: str) -> None:
+    digest = hashlib.sha256()
+    downloaded = 0
+    created = False
+    try:
+        with httpx.stream(
+            "GET",
+            url,
+            headers={
+                "Accept-Encoding": "identity",
+                "User-Agent": f"dwell/{__version__}",
+            },
+            follow_redirects=True,
+            timeout=60,
+        ) as response:
+            response.raise_for_status()
+            if any(item.url.scheme != "https" for item in (*response.history, response)):
+                raise DwellError("setup_failed", "Runtime archive redirected outside HTTPS.")
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None and int(content_length) > _MAX_ARCHIVE_BYTES:
+                raise DwellError("setup_failed", "Runtime archive exceeds the download limit.")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(destination, flags, 0o600)
+            created = True
+            try:
+                with os.fdopen(descriptor, "wb", closefd=False) as output:
+                    for chunk in response.iter_raw(chunk_size=1024 * 1024):
+                        downloaded += len(chunk)
+                        if downloaded > _MAX_ARCHIVE_BYTES:
+                            raise DwellError(
+                                "setup_failed", "Runtime archive exceeds the download limit."
+                            )
+                        digest.update(chunk)
+                        output.write(chunk)
+            finally:
+                os.close(descriptor)
+    except DwellError:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise
+    except (OSError, ValueError, httpx.HTTPError) as exc:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise DwellError("setup_failed", f"Runtime archive download failed: {exc}") from exc
+
+    actual_sha256 = digest.hexdigest()
+    if actual_sha256 != expected_sha256:
+        if created:
+            destination.unlink(missing_ok=True)
+        raise DwellError(
+            "setup_failed",
+            "Runtime archive checksum verification failed.",
+            details={"expected": expected_sha256, "actual": actual_sha256},
+        )
 
 
 def load_runtime_manifest() -> tuple[RuntimeSpec, ...]:
@@ -402,12 +508,268 @@ def _runtime_worktree_is_dirty(
 
 def _sha256_regular_file(path: Path) -> str:
     digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
             raise OSError("provenance input is not a regular file")
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
+        with os.fdopen(descriptor, "rb", closefd=False) as stream:
+            while chunk := stream.read(1024 * 1024):
+                digest.update(chunk)
+    finally:
+        os.close(descriptor)
     return digest.hexdigest()
+
+
+def _runtime_source_payload(runtime: RuntimeSpec) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": runtime.id,
+        "commit": runtime.commit,
+        "python": runtime.python,
+    }
+    if runtime.repository is not None:
+        payload["repository"] = _normalized_remote(runtime.repository)
+        payload["branch"] = runtime.branch
+    if runtime.archive_url is not None:
+        payload["archive_url"] = runtime.archive_url
+        payload["archive_sha256"] = runtime.archive_sha256
+    return payload
+
+
+def _runtime_archive_source_payload(runtime: RuntimeSpec) -> dict[str, str]:
+    if runtime.archive_url is None or runtime.archive_sha256 is None:
+        raise ValueError("runtime does not define an archive")
+    return {
+        "id": runtime.id,
+        "archive_url": runtime.archive_url,
+        "archive_sha256": runtime.archive_sha256,
+        "commit": runtime.commit,
+        "python": runtime.python,
+    }
+
+
+def _archive_member_path(name: str, root: str | None) -> tuple[str, PurePosixPath | None]:
+    raw = name.removesuffix("/")
+    parts = raw.split("/")
+    if not raw or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("archive contains an unsafe path")
+    if root is not None and parts[0] != root:
+        raise ValueError("archive contains multiple top-level directories")
+    root = parts[0]
+    if len(parts) == 1:
+        return root, None
+    relative = PurePosixPath(*parts[1:])
+    if (
+        relative.is_absolute()
+        or len(relative.as_posix().encode()) > 1_024
+        or relative.parts[0] in {".git", ".venv"}
+        or relative.as_posix() in {_SOURCE_ARCHIVE_FILE, _SOURCE_MANIFEST_FILE}
+    ):
+        raise ValueError("archive contains a reserved or unsafe path")
+    return root, relative
+
+
+def _open_new_regular_file(path: Path, mode: int):
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, mode)
+    return os.fdopen(descriptor, "wb")
+
+
+def _archive_manifest_payload(
+    archive: Path,
+    *,
+    source: Mapping[str, Any],
+    extract_to: Path | None = None,
+) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    root: str | None = None
+    content_bytes = 0
+    try:
+        with tarfile.open(archive, mode="r:gz") as bundle:
+            for index, member in enumerate(bundle):
+                if index >= _MAX_ARCHIVE_ENTRIES:
+                    raise ValueError("archive contains too many entries")
+                root, relative = _archive_member_path(member.name, root)
+                if relative is None:
+                    if not member.isdir():
+                        raise ValueError("archive root is not a directory")
+                    continue
+                name = relative.as_posix()
+                if name in seen:
+                    raise ValueError("archive contains duplicate paths")
+                seen.add(name)
+                destination = extract_to / Path(*relative.parts) if extract_to is not None else None
+                if member.isdir():
+                    if destination is not None:
+                        destination.mkdir(parents=True, exist_ok=False)
+                        destination.chmod(0o755)
+                    continue
+                if not member.isfile() or member.size < 0:
+                    raise ValueError("archive contains links or unsupported file types")
+                content_bytes += member.size
+                if content_bytes > _MAX_ARCHIVE_CONTENT_BYTES:
+                    raise ValueError("archive expands beyond the content limit")
+                stream = bundle.extractfile(member)
+                if stream is None:
+                    raise ValueError("archive member could not be read")
+                digest = hashlib.sha256()
+                written = 0
+                mode = 0o755 if member.mode & 0o111 else 0o644
+                if destination is not None:
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    output = _open_new_regular_file(destination, mode)
+                else:
+                    output = None
+                try:
+                    while chunk := stream.read(1024 * 1024):
+                        written += len(chunk)
+                        if written > member.size:
+                            raise ValueError("archive member exceeds its declared size")
+                        digest.update(chunk)
+                        if output is not None:
+                            output.write(chunk)
+                finally:
+                    stream.close()
+                    if output is not None:
+                        output.close()
+                if written != member.size:
+                    raise ValueError("archive member is truncated")
+                if destination is not None:
+                    destination.chmod(mode)
+                entries.append(
+                    {
+                        "path": name,
+                        "sha256": digest.hexdigest(),
+                        "mode": mode,
+                        "size": member.size,
+                    }
+                )
+    except (OSError, tarfile.TarError, ValueError) as exc:
+        raise DwellError("setup_failed", f"Runtime archive is invalid: {exc}") from exc
+    if root is None or not entries:
+        raise DwellError("setup_failed", "Runtime archive contains no source files.")
+    return {
+        "schema_version": 1,
+        "source": dict(source),
+        "entries": sorted(entries, key=lambda item: item["path"]),
+    }
+
+
+def _read_source_manifest(runtime_dir: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(
+            _read_small_regular_text(
+                runtime_dir / _SOURCE_MANIFEST_FILE,
+                limit=_SOURCE_MANIFEST_LIMIT,
+            )
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    source = payload.get("source")
+    entries = payload.get("entries")
+    if not isinstance(source, dict) or not isinstance(entries, list):
+        return None
+    if set(source) != _ARCHIVE_SOURCE_FIELDS:
+        return None
+    if not _valid_archive_source(source):
+        return None
+    return payload
+
+
+def _valid_archive_source(source: Mapping[str, Any]) -> bool:
+    if not all(
+        isinstance(source.get(name), str) and source[name] for name in _ARCHIVE_SOURCE_FIELDS
+    ):
+        return False
+    commit = source["commit"]
+    archive_url = source["archive_url"]
+    parsed = urllib.parse.urlsplit(archive_url)
+    return bool(
+        _COMMIT_RE.fullmatch(commit)
+        and _SHA256_RE.fullmatch(source["archive_sha256"])
+        and parsed.scheme == "https"
+        and parsed.netloc
+        and commit in archive_url
+    )
+
+
+def _read_recorded_archive_source(state_file: Path) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(_read_small_regular_text(state_file, limit=_STRUCTURAL_FILE_LIMIT))
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        return None
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict):
+        return None
+    source = {name: runtime.get(name) for name in _ARCHIVE_SOURCE_FIELDS}
+    return source if _valid_archive_source(source) else None
+
+
+def _archive_filesystem_entries(runtime_dir: Path) -> set[str]:
+    entries: set[str] = set()
+    pending = [runtime_dir]
+    while pending:
+        directory = pending.pop()
+        with os.scandir(directory) as children:
+            for child in children:
+                path = Path(child.path)
+                relative = path.relative_to(runtime_dir)
+                if relative.parts[0] == ".venv" or relative.as_posix() in {
+                    _SOURCE_ARCHIVE_FILE,
+                    _SOURCE_MANIFEST_FILE,
+                }:
+                    continue
+                if child.is_dir(follow_symlinks=False):
+                    pending.append(path)
+                else:
+                    entries.add(relative.as_posix())
+    return entries
+
+
+def _archive_source_is_dirty(
+    runtime_dir: Path,
+    *,
+    trusted_source: Mapping[str, Any],
+) -> bool:
+    manifest = _read_source_manifest(runtime_dir)
+    if manifest is None:
+        return True
+    source = manifest["source"]
+    if source != dict(trusted_source):
+        return True
+    archive = runtime_dir / _SOURCE_ARCHIVE_FILE
+    try:
+        if _sha256_regular_file(archive) != source["archive_sha256"]:
+            return True
+        expected = _archive_manifest_payload(archive, source=source)
+        if manifest != expected:
+            return True
+        expected_entries = {entry["path"]: entry for entry in expected["entries"]}
+        if _archive_filesystem_entries(runtime_dir) != set(expected_entries):
+            return True
+        for name, entry in expected_entries.items():
+            path = runtime_dir / Path(*PurePosixPath(name).parts)
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size != entry["size"]
+                or (metadata.st_mode & 0o777) != entry["mode"]
+                or _sha256_regular_file(path) != entry["sha256"]
+            ):
+                return True
+    except (DwellError, OSError, TypeError, ValueError):
+        return True
+    return False
 
 
 def _venv_tree_fingerprint(venv: Path, runtime: RuntimeSpec) -> str:
@@ -474,18 +836,14 @@ def _venv_provenance_payload(runtime_dir: Path, runtime: RuntimeSpec) -> dict[st
     python = venv / "bin" / "python"
     cli = venv / "bin" / "ltx-2-mlx"
     lockfile = runtime_dir / "uv.lock"
+    python_for_hash = python.resolve(strict=True) if python.is_symlink() else python
     return {
         "schema_version": 1,
-        "runtime": {
-            "id": runtime.id,
-            "repository": _normalized_remote(runtime.repository),
-            "commit": runtime.commit,
-            "python": runtime.python,
-        },
+        "runtime": _runtime_source_payload(runtime),
         "runtime_dir": str(runtime_dir),
         "venv_dir": str(venv),
         "uv_lock_sha256": _sha256_regular_file(lockfile),
-        "python_sha256": _sha256_regular_file(python),
+        "python_sha256": _sha256_regular_file(python_for_hash),
         "cli_sha256": _sha256_regular_file(cli),
         "tree_fingerprint": _venv_tree_fingerprint(venv, runtime),
     }
@@ -509,11 +867,13 @@ class SetupManager:
         runtime: RuntimeSpec | None = None,
         runner: Runner = _run,
         doctor_runner: DoctorRunner = run_doctor,
+        archive_downloader: ArchiveDownloader = _download_archive,
     ) -> None:
         self.config = config or DwellConfig.from_env()
         self.runtime = runtime or self._default_runtime()
         self.runner = runner
         self.doctor_runner = doctor_runner
+        self.archive_downloader = archive_downloader
         self._tools: dict[str, str] = {}
 
     @staticmethod
@@ -699,7 +1059,10 @@ class SetupManager:
                 f"detected macOS {macos_version or 'unknown'}.",
             )
         unavailable: dict[str, str] = {}
-        for name, version_arguments in _TOOL_VERSION_ARGUMENTS.items():
+        required_tools = dict(_TOOL_VERSION_ARGUMENTS)
+        if not self.runtime.uses_archive:
+            required_tools["git"] = ("--version",)
+        for name, version_arguments in required_tools.items():
             executable = shutil.which(name)
             if executable is None:
                 unavailable[name] = "not found"
@@ -721,7 +1084,8 @@ class SetupManager:
                 details={"unavailable": unavailable},
             )
 
-        messages = ["Platform: macOS 14+ arm64", "Tools: uv, git, ffmpeg, ffprobe"]
+        tool_names = ", ".join(required_tools)
+        messages = ["Platform: macOS 14+ arm64", f"Tools: {tool_names}"]
         memory = self._physical_memory_gib()
         if memory is None:
             messages.append("Memory: unable to determine unified-memory capacity")
@@ -810,59 +1174,124 @@ class SetupManager:
         probe_venv: bool,
     ) -> RuntimeInspection:
         if not runtime_dir.exists():
-            return RuntimeInspection(False, False, None, None, False, False, False, ("missing",))
+            return RuntimeInspection(
+                exists=False,
+                source_valid=False,
+                remote=None,
+                commit=None,
+                source_hash=None,
+                dirty=False,
+                venv_exists=False,
+                venv_healthy=False,
+                problems=("missing",),
+            )
         if runtime_dir.is_symlink():
             return RuntimeInspection(
-                True,
-                False,
-                None,
-                None,
-                True,
-                False,
-                False,
-                ("runtime path is a symlink",),
+                exists=True,
+                source_valid=False,
+                remote=None,
+                commit=None,
+                source_hash=None,
+                dirty=True,
+                venv_exists=False,
+                venv_healthy=False,
+                problems=("runtime path is a symlink",),
             )
-        if not runtime_dir.is_dir() or not (runtime_dir / ".git").exists():
+        if not runtime_dir.is_dir():
             return RuntimeInspection(
-                True,
-                False,
-                None,
-                None,
-                True,
-                False,
-                False,
-                ("runtime path is not a Git checkout",),
+                exists=True,
+                source_valid=False,
+                remote=None,
+                commit=None,
+                source_hash=None,
+                dirty=True,
+                venv_exists=False,
+                venv_healthy=False,
+                problems=("runtime path is not a directory",),
             )
 
         problems: list[str] = []
-        # Read canonical clone metadata as bounded plain data. No Git command
-        # sees this checkout's config during inspection.
-        remote, commit = _read_runtime_identity(runtime_dir)
-        if remote is None:
-            problems.append("origin remote is unreadable")
-        elif _normalized_remote(remote) != _normalized_remote(self.runtime.repository):
-            problems.append(f"origin remote is {remote}; expected {self.runtime.repository}")
-
-        if commit is None or not _COMMIT_RE.fullmatch(commit):
-            problems.append("HEAD commit is unreadable")
-        elif commit != self.runtime.commit:
-            problems.append(f"HEAD is {commit}; expected {self.runtime.commit}")
-
-        dirty = commit is None or _runtime_worktree_is_dirty(
-            runtime_dir,
-            expected_commit=commit,
-            executable=self._tools.get("git") or shutil.which("git") or "git",
-            runner=self.runner,
-        )
-        if dirty:
-            problems.append("runtime checkout has local changes")
-
-        source_valid = (
-            remote is not None
-            and _normalized_remote(remote) == _normalized_remote(self.runtime.repository)
-            and commit == self.runtime.commit
-            and not dirty
-        )
+        source_hash: str | None = None
+        git_directory = runtime_dir / ".git"
+        if self.runtime.uses_archive and not git_directory.exists():
+            manifest = _read_source_manifest(runtime_dir)
+            if manifest is None:
+                remote = None
+                commit = None
+                dirty = True
+                source_valid = False
+                problems.append("runtime archive source manifest is missing or unreadable")
+            else:
+                source = manifest["source"]
+                remote = source["archive_url"]
+                commit = source["commit"]
+                source_hash = source["archive_sha256"]
+                expected_source = _runtime_archive_source_payload(self.runtime)
+                recorded_source = _read_recorded_archive_source(self.config.setup_state_file)
+                trusted_source = (
+                    expected_source
+                    if source == expected_source
+                    else recorded_source
+                    if recorded_source is not None and source == recorded_source
+                    else None
+                )
+                dirty = trusted_source is None or _archive_source_is_dirty(
+                    runtime_dir,
+                    trusted_source=trusted_source or expected_source,
+                )
+                if source != expected_source:
+                    problems.append("runtime archive identity does not match the manifest")
+                if dirty:
+                    problems.append("runtime archive source has local or unsafe changes")
+                source_valid = source == expected_source and not dirty
+        else:
+            if not git_directory.exists():
+                return RuntimeInspection(
+                    exists=True,
+                    source_valid=False,
+                    remote=None,
+                    commit=None,
+                    source_hash=None,
+                    dirty=True,
+                    venv_exists=False,
+                    venv_healthy=False,
+                    problems=("runtime path is not a recognized source checkout",),
+                )
+            # Read canonical clone metadata as bounded plain data. No Git command
+            # sees this checkout's config during inspection.
+            remote, commit = _read_runtime_identity(runtime_dir)
+            expected_repository = self.runtime.repository
+            remote_ok = (
+                remote is not None
+                and expected_repository is not None
+                and _normalized_remote(remote) == _normalized_remote(expected_repository)
+            )
+            commit_ok = commit == self.runtime.commit
+            if remote is None:
+                problems.append("origin remote is unreadable")
+            elif not remote_ok:
+                problems.append(f"origin remote is {remote}; expected {expected_repository}")
+            if commit is None or not _COMMIT_RE.fullmatch(commit):
+                problems.append("HEAD commit is unreadable")
+            elif not commit_ok:
+                problems.append(f"HEAD is {commit}; expected {self.runtime.commit}")
+            worktree_dirty = commit is None or _runtime_worktree_is_dirty(
+                runtime_dir,
+                expected_commit=commit or self.runtime.commit,
+                executable=self._tools.get("git") or shutil.which("git") or "git",
+                runner=self.runner,
+            )
+            migrating_legacy_source = self.runtime.uses_archive
+            # Archive migration is allowed only for the exact trusted legacy
+            # checkout. A mismatched remote/commit is not treated as replaceable.
+            dirty = worktree_dirty or (migrating_legacy_source and not (remote_ok and commit_ok))
+            if worktree_dirty:
+                problems.append("runtime checkout has local changes")
+            if migrating_legacy_source:
+                problems.append("runtime uses legacy Git source; run dwell setup --upgrade")
+                source_valid = False
+            else:
+                source_valid = remote_ok and commit_ok and not dirty
 
         venv = runtime_dir / ".venv"
         # Path.exists() is false for a dangling symlink, but it remains an
@@ -882,14 +1311,15 @@ class SetupManager:
             if not venv_healthy:
                 problems.append("runtime virtual environment is missing or unhealthy")
         return RuntimeInspection(
-            True,
-            source_valid,
-            remote,
-            commit,
-            dirty,
-            venv_exists,
-            venv_healthy,
-            tuple(problems),
+            exists=True,
+            source_valid=source_valid,
+            remote=remote,
+            commit=commit,
+            source_hash=source_hash,
+            dirty=dirty,
+            venv_exists=venv_exists,
+            venv_healthy=venv_healthy,
+            problems=tuple(problems),
         )
 
     def _venv_is_structurally_healthy(self, runtime_dir: Path) -> bool:
@@ -1063,7 +1493,7 @@ class SetupManager:
         if not inspection.source_valid:
             raise DwellError(
                 "runtime_mismatch",
-                "Repair requires the manifest commit and remote; use dwell setup --upgrade.",
+                "Repair requires the pinned manifest source; use dwell setup --upgrade.",
                 details={"problems": inspection.problems},
             )
         if inspection.venv_healthy:
@@ -1187,6 +1617,7 @@ class SetupManager:
             or current.dirty
             or current.remote != expected.remote
             or current.commit != expected.commit
+            or current.source_hash != expected.source_hash
         )
         if changed:
             raise DwellError(
@@ -1198,6 +1629,8 @@ class SetupManager:
                     "actual_remote": current.remote,
                     "expected_commit": expected.commit,
                     "actual_commit": current.commit,
+                    "expected_source_hash": expected.source_hash,
+                    "actual_source_hash": current.source_hash,
                     "problems": current.problems,
                 },
             )
@@ -1217,8 +1650,34 @@ class SetupManager:
 
     def _clone_staging(self) -> Path:
         staging = Path(tempfile.mkdtemp(prefix=f"{self.runtime.id}-", dir=self.config.tmp_dir))
-        # Clone source only. The venv is deliberately created after the move to
-        # its final path because generated console scripts contain absolute paths.
+        # Prepare source only. The venv is deliberately created after the move
+        # to its final path because generated console scripts contain absolute paths.
+        if self.runtime.uses_archive:
+            assert self.runtime.archive_url is not None
+            assert self.runtime.archive_sha256 is not None
+            archive = staging / _SOURCE_ARCHIVE_FILE
+            try:
+                self.archive_downloader(
+                    self.runtime.archive_url,
+                    archive,
+                    self.runtime.archive_sha256,
+                )
+                if _sha256_regular_file(archive) != self.runtime.archive_sha256:
+                    raise DwellError(
+                        "setup_failed", "Runtime archive checksum verification failed."
+                    )
+                manifest = _archive_manifest_payload(
+                    archive,
+                    source=_runtime_archive_source_payload(self.runtime),
+                    extract_to=staging,
+                )
+                _atomic_write_json(staging / _SOURCE_MANIFEST_FILE, manifest)
+                self._verify_staging(staging)
+            except BaseException:
+                self._cleanup_staging(staging)
+                raise
+            return staging
+
         clone = self.runner(
             [
                 self._tools["git"],
@@ -1244,6 +1703,21 @@ class SetupManager:
         return staging
 
     def _verify_staging(self, staging: Path) -> None:
+        if self.runtime.uses_archive:
+            manifest = _read_source_manifest(staging)
+            if manifest is None or manifest["source"] != _runtime_archive_source_payload(
+                self.runtime
+            ):
+                self._cleanup_staging(staging)
+                raise DwellError("runtime_mismatch", "Runtime archive identity is invalid.")
+            if _archive_source_is_dirty(
+                staging,
+                trusted_source=_runtime_archive_source_payload(self.runtime),
+            ):
+                self._cleanup_staging(staging)
+                raise DwellError("dirty_runtime", "Extracted runtime archive failed verification.")
+            return
+
         remote, commit = _read_runtime_identity(staging)
         dirty = _runtime_worktree_is_dirty(
             staging,
@@ -1251,8 +1725,11 @@ class SetupManager:
             executable=self._tools.get("git") or shutil.which("git") or "git",
             runner=self.runner,
         )
-        if remote is None or _normalized_remote(remote) != _normalized_remote(
-            self.runtime.repository
+        expected_repository = self.runtime.repository
+        if (
+            remote is None
+            or expected_repository is None
+            or _normalized_remote(remote) != _normalized_remote(expected_repository)
         ):
             self._cleanup_staging(staging)
             raise DwellError("runtime_mismatch", "Cloned runtime remote verification failed.")
@@ -1266,7 +1743,7 @@ class SetupManager:
     def _sync_runtime(self) -> None:
         environment = dict(os.environ)
         for name in tuple(environment):
-            if name.startswith("UV_") or name == "VIRTUAL_ENV":
+            if name.startswith(("UV_", "PIP_")) or name == "VIRTUAL_ENV":
                 environment.pop(name)
         environment.update(
             {
@@ -1359,13 +1836,7 @@ class SetupManager:
             {
                 "schema_version": 1,
                 "dwell_version": __version__,
-                "runtime": {
-                    "id": self.runtime.id,
-                    "repository": self.runtime.repository,
-                    "branch": self.runtime.branch,
-                    "commit": self.runtime.commit,
-                    "python": self.runtime.python,
-                },
+                "runtime": _runtime_source_payload(self.runtime),
                 "updated_at": datetime.now(UTC).isoformat(),
             },
         )
@@ -1382,9 +1853,5 @@ class SetupManager:
             payload.get("schema_version") == 1
             and payload.get("dwell_version") == __version__
             and isinstance(runtime, dict)
-            and runtime.get("id") == self.runtime.id
-            and runtime.get("repository") == self.runtime.repository
-            and runtime.get("branch") == self.runtime.branch
-            and runtime.get("commit") == self.runtime.commit
-            and runtime.get("python") == self.runtime.python
+            and runtime == _runtime_source_payload(self.runtime)
         )

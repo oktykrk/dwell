@@ -6,6 +6,19 @@ from pathlib import Path
 from dwell import doctor as doctor_module
 from dwell.config import DwellConfig
 from dwell.doctor import CheckLevel, _environment_checks, _mlx_lm_checks, _runtime_checks
+from dwell.setup import RuntimeSpec
+
+_LTX_COMMIT = "8ebae0a7cb08312fbf884790b91b4d155e714cdc"
+
+
+def _legacy_runtime() -> RuntimeSpec:
+    return RuntimeSpec(
+        id="ltx-2-mlx",
+        repository="https://github.com/xocialize/ltx-2-mlx.git",
+        branch="main",
+        commit=_LTX_COMMIT,
+        python="3.11",
+    )
 
 
 def test_ltx_doctor_help_is_strictly_offline_and_never_syncs(
@@ -61,6 +74,7 @@ def test_ltx_doctor_help_is_strictly_offline_and_never_syncs(
 
     monkeypatch.setattr(doctor_module, "_run", fake_run)
     monkeypatch.setattr(doctor_module.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr("dwell.setup.load_runtime_manifest", lambda: (_legacy_runtime(),))
     monkeypatch.setattr("dwell.setup._venv_provenance_is_valid", lambda *_args: True)
 
     checks = _runtime_checks(config)
@@ -116,6 +130,7 @@ def test_untrusted_runtime_executable_is_never_run(tmp_path: Path, monkeypatch) 
 
     monkeypatch.setattr(doctor_module, "_run", fake_run)
     monkeypatch.setattr(doctor_module.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr("dwell.setup.load_runtime_manifest", lambda: (_legacy_runtime(),))
 
     checks = _runtime_checks(config)
 
@@ -153,6 +168,7 @@ def test_runtime_without_valid_venv_provenance_is_never_run(tmp_path: Path, monk
 
     monkeypatch.setattr(doctor_module, "_run", fake_run)
     monkeypatch.setattr(doctor_module.shutil, "which", lambda name: f"/tools/{name}")
+    monkeypatch.setattr("dwell.setup.load_runtime_manifest", lambda: (_legacy_runtime(),))
     monkeypatch.setattr("dwell.setup._venv_provenance_is_valid", lambda *_args: False)
 
     checks = _runtime_checks(config)

@@ -5,6 +5,8 @@
       "id": "ltx-2-mlx",
       "repository": "https://github.com/xocialize/ltx-2-mlx.git",
       "branch": "main",
+      "archive_url": "https://github.com/xocialize/ltx-2-mlx/archive/8ebae0a7cb08312fbf884790b91b4d155e714cdc.tar.gz",
+      "archive_sha256": "3a537bec3b59146cb9e1c4fe81c8769bdcf7e790bd797bfd2d535c730bfea6b4",
       "commit": "8ebae0a7cb08312fbf884790b91b4d155e714cdc",
       "python": "3.11"
     }

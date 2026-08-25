@@ -50,52 +50,65 @@ truthfully reports that there is no persistent runtime state to release. The run
 interface also supports the resident MLX-LM text engine. Dwell starts that sidecar lazily on the
 first chat request, keeps the model available for later requests, and owns its shutdown.
 
-## Installation with Homebrew
+## Installation
 
-The repository is private, so first make sure your GitHub account has access and your SSH key can
-authenticate to GitHub. Then install Dwell on an Apple Silicon Mac running macOS 14 Sonoma or
-newer, without cloning the repository manually:
+Install Dwell on an Apple Silicon Mac running macOS 14 Sonoma or newer with one command:
 
 ```bash
-export HOMEBREW_GITHUB_API_TOKEN="$(gh auth token)"
-brew tap oktykrk/dwell git@github.com:oktykrk/dwell.git
-brew install dwell
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/oktykrk/dwell/releases/latest/download/install.sh | sh
+```
+
+Then use the CLI directly:
+
+```bash
+dwell --version
 dwell setup
 dwell models install ltx-2.5-bf16
 dwell start
 dwell status
 ```
 
-`brew install` installs the Dwell CLI, the pinned MLX-LM text runtime, and its system dependencies
-in Homebrew's managed prefix. Published releases include a prebuilt Apple Silicon bottle for macOS
-15 and newer. `HOMEBREW_GITHUB_API_TOKEN` lets Homebrew authenticate when it downloads that bottle
-from this private repository; a fine-grained token with read access to the repository is enough.
-`dwell setup` prepares the separate per-user LTX video runtime under `~/.dwell`; it does not
-download model weights, start the server, or edit `.zshrc` or any other shell configuration. Model
-weights are downloaded only by the explicit `dwell models install …` command.
+The installer downloads only checksummed release artifacts and prebuilt wheels. It privately
+manages its pinned `uv`, Python, FFmpeg, and FFprobe versions under `~/.local/share/dwell`; the user
+does not need to install or learn any of those tools. It never invokes a compiler and does not
+require Homebrew. A small `dwell` launcher is installed into `/usr/local/bin`; if that directory is
+not writable, the installer asks for `sudo` only while installing that launcher. Application data
+and model weights remain separate under `~/.dwell`.
 
-### Updating a Homebrew installation
+If `command -v dwell` already points to an older Homebrew or source-checkout installation, remove
+that command first and run `hash -r`. For a Homebrew installation, use `brew uninstall dwell`.
+The installer deliberately refuses to leave a new launcher hidden behind an older one, and this
+migration does not remove anything under `~/.dwell`.
+
+`dwell setup` prepares the pinned per-user LTX video runtime under `~/.dwell`. It does not download
+model weights or start the server. Model weights are downloaded only by the explicit
+`dwell models install …` command.
+
+### Updating
 
 ```bash
-brew update
-brew upgrade dwell
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/oktykrk/dwell/releases/latest/download/install.sh | sh
 dwell setup --upgrade
 dwell doctor
 ```
 
-The setup upgrade updates the pinned runtime while preserving models, generated outputs, and job
-data.
+The installer keeps the previous application version until the new version has passed its smoke
+test, then switches atomically. The setup upgrade updates the pinned video runtime while preserving
+models, generated outputs, and job data.
 
-### Uninstalling Homebrew Dwell
+### Uninstalling the application
+
+Stop Dwell, then remove the installer-managed launcher and application runtime:
 
 ```bash
 dwell stop
-brew uninstall dwell
+sudo rm -f /usr/local/bin/dwell
+rm -rf "$HOME/.local/share/dwell"
 ```
 
-`brew uninstall` removes the packaged CLI but does not delete user data. In particular,
-`~/.dwell/models`, outputs, state, and logs are preserved. Automatic data deletion is intentionally
-outside the MVP.
+This preserves configuration, models, generated outputs, jobs, and logs under `~/.dwell`.
 
 > **Warning:** To remove all Dwell data manually, run `rm -rf "$HOME/.dwell"` only after checking
 > that the path is correct and retaining anything you need. This permanently deletes downloaded
@@ -113,9 +126,8 @@ uv run dwell --help
 The operational home defaults to `~/.dwell`. Source code may live elsewhere; caches, runtimes,
 state, logs, temporary artifacts, and outputs remain under the operational home.
 
-For development, `uv run dwell …` uses the project environment. A Homebrew installation links
-`dwell` into Homebrew's normal `bin` directory; `~/.dwell/bin` and shell startup-file edits are not
-required.
+For development, `uv run dwell …` uses the project environment. The end-user installer and its
+managed Python environment are independent from a source checkout.
 
 ## Directory layout
 
@@ -124,7 +136,7 @@ required.
 ├── models/
 │   └── huggingface/       shared HF_HOME (Hub and Xet caches are preserved)
 ├── runtimes/
-│   └── ltx-2-mlx/         external runtime; remains its own Git repository
+│   └── ltx-2-mlx/         pinned, checksum-verified external runtime
 ├── services/
 │   └── api/               pointer/deployment location for the Dwell service
 ├── outputs/
@@ -440,14 +452,24 @@ installation, and process management without model weights. Do not run a real
 Releases never run automatically on a commit or tag push. In GitHub Actions, open the **Release**
 workflow, choose **Run workflow** from `main`, enter the version already recorded in
 `pyproject.toml`, and select **publish**. Leaving **publish** unselected performs the complete
-project, package, and Homebrew validation without changing the remote repository.
+project, package, installer, and checksum validation without changing the remote repository.
 
-For a new version, a publishing run captures the selected `main` commit as the immutable release
-source, validates the matching `v<version>` tag and `Formula/dwell.rb` update, and then creates the
-GitHub Release.
-Commits that reach `main` while validation is running are preserved: the tag remains on the
-captured source commit and the Formula update is added to the latest compatible `main`, with both
-refs pushed atomically. A concurrent Formula change is never overwritten. Normal CI continues to
-validate development commits and pull requests, but it does not publish them. If GitHub Release
-creation is interrupted after the refs land, run the same version again from the new `main`; the
-workflow verifies the existing refs and resumes the incomplete release.
+A publishing run captures the selected `main` commit as the immutable release source, creates its
+annotated `v<version>` tag without force, and publishes the wheel, source distribution, locked
+macOS requirements, installer, and `SHA256SUMS`. The release workflow uses an Ubuntu runner and
+prebuilt packages; it does not build a Homebrew formula or bottle.
+
+Normal CI continues to validate development commits and pull requests, but it never publishes
+them. If a publishing run is interrupted, dispatch the same version again. The workflow verifies
+the existing tag and asset digests, repairs an incomplete draft, and never overwrites an already
+published release.
+
+## Managed FFmpeg
+
+The installer downloads the pinned native Apple Silicon FFmpeg and FFprobe executables directly
+from [Martin Riedl's signed macOS builds](https://ffmpeg.martin-riedl.de/), verifies their published
+SHA-256 values and the publisher's Apple Developer ID, and keeps them private to Dwell. Dwell's
+shell installer and Python package do not require the Dwell maintainer to hold a Developer ID.
+Those executables are separate GPLv3 programs; their reproducible build source is published in the
+[FFmpeg build-script repository](https://git.martin-riedl.de/ffmpeg/build-script). Dwell invokes
+them as subprocesses and does not redistribute them in its own MIT-licensed release assets.
