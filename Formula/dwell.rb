@@ -22,7 +22,6 @@ class Dwell < Formula
   depends_on "numpy"
   depends_on "protobuf"
   depends_on "python@3.14"
-  depends_on "sentencepiece"
   depends_on "uv"
 
   resource "annotated-doc" do
@@ -165,9 +164,13 @@ class Dwell < Formula
     sha256 "fabaf3e0f18a6618d9b36560682562157f77c2b71fcffc7b432be2baed9d753d"
   end
 
+  # The 0.2.2 sdist rebuilds its bundled C++ library and fails under Homebrew's
+  # Python 3.14 build environment. Dwell only supports Apple Silicon, so use the
+  # matching upstream wheel and avoid that redundant native build.
   resource "sentencepiece" do
-    url "https://files.pythonhosted.org/packages/cc/33/ea3cb3839607eb175da835244a798f797f478c5ddf0e8ecdf57ea85a4c70/sentencepiece-0.2.2.tar.gz"
-    sha256 "3d2b5e824b5622038dc7b490897efe05ebbbb9e7350fc142f3ecc8789ef9bdf6"
+    url "https://files.pythonhosted.org/packages/d1/18/823954c9c90e74eba09fb96752dc37a5555df00d69866cb9406d1725dc7e/sentencepiece-0.2.2-cp314-cp314-macosx_11_0_arm64.whl",
+        using: :nounzip
+    sha256 "79bac5a251f23a7341e28fda9ce0d5319edf45328239ce037c0682936f137906"
   end
 
   resource "shellingham" do
@@ -219,7 +222,12 @@ class Dwell < Formula
     # tokenizers, safetensors, and hf-xet build PyO3 extensions through maturin.
     ENV.append_to_rustflags "-C link-arg=-Wl,-undefined,dynamic_lookup"
 
-    venv = virtualenv_install_with_resources(without: "hf-xet")
+    venv = virtualenv_install_with_resources(without: %w[hf-xet sentencepiece])
+
+    sentencepiece = resource("sentencepiece")
+    sentencepiece.stage do
+      venv.pip_install Pathname.pwd/sentencepiece.downloader.basename
+    end
 
     resource("hf-xet").stage do
       # Avoid indirectly building the bundled aws-lc stack inside Homebrew's
@@ -240,7 +248,10 @@ class Dwell < Formula
     assert_equal "0.31.3", shell_output(
       "#{libexec}/bin/python -c \"import importlib.metadata; print(importlib.metadata.version('mlx-lm'))\"",
     ).strip
-    system libexec/"bin/python", "-c", "import mlx_lm.server"
+    assert_equal "0.2.2", shell_output(
+      "#{libexec}/bin/python -c \"import importlib.metadata; print(importlib.metadata.version('sentencepiece'))\"",
+    ).strip
+    system libexec/"bin/python", "-c", "import mlx_lm.server; import sentencepiece"
     assert_match (testpath/".dwell").to_s, shell_output("#{bin}/dwell config show")
     assert_match "ltx-2.5-bf16", shell_output("#{bin}/dwell models list")
     assert_match "qwen3-coder-30b-a3b-4bit", shell_output("#{bin}/dwell models list")
