@@ -1,6 +1,6 @@
 name: Release
 
-run-name: Release (${{ inputs.bump }} bump)
+run-name: Release (${{ inputs.bump }})
 
 on:
   workflow_dispatch:
@@ -269,7 +269,9 @@ jobs:
             "$requirements"
             "install.sh"
           )
-          mapfile -t dist_files < <(find dist -maxdepth 1 -type f -print | sort)
+          mapfile -t dist_files < <(
+            find dist -maxdepth 1 -type f ! -name '.gitignore' -print | sort
+          )
           test "${#dist_files[@]}" -eq "${#release_inputs[@]}"
 
           (
