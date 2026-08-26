@@ -115,10 +115,25 @@ jobs:
             release_state="missing"
             if release_json=$(gh api \
               "repos/$GITHUB_REPOSITORY/releases/tags/$current_tag" 2>/dev/null); then
-              if test "$(jq -r '.draft' <<< "$release_json")" = "true"; then
-                release_state="draft"
-              else
-                release_state="published"
+              release_state="published"
+            else
+              # GitHub's release-by-tag endpoint does not return draft releases.
+              releases_json=$(gh api \
+                "repos/$GITHUB_REPOSITORY/releases?per_page=100")
+              release_count=$(jq --arg tag "$current_tag" \
+                '[.[] | select(.tag_name == $tag)] | length' <<< "$releases_json")
+              test "$release_count" -le 1 || {
+                echo "Multiple GitHub releases use $current_tag." >&2
+                exit 1
+              }
+              if test "$release_count" -eq 1; then
+                release_json=$(jq --arg tag "$current_tag" \
+                  '.[] | select(.tag_name == $tag)' <<< "$releases_json")
+                if test "$(jq -r '.draft' <<< "$release_json")" = "true"; then
+                  release_state="draft"
+                else
+                  release_state="published"
+                fi
               fi
             fi
 
@@ -463,34 +478,52 @@ jobs:
           expected_names="$RUNNER_TEMP/expected-release-assets.txt"
           printf '%s\n' "${release_assets[@]##*/}" | sort > "$expected_names"
           release_json="$RUNNER_TEMP/release.json"
+          releases_json="$RUNNER_TEMP/releases.json"
 
-          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
-            gh release create "$RELEASE_TAG" \
-              --draft \
-              --verify-tag \
-              --generate-notes \
-              --title "Dwell $RELEASE_TAG"
+          load_release_by_tag() {
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
+              > "$release_json" 2>/dev/null; then
+              return 0
+            fi
+
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$releases_json"
+            release_count=$(jq --arg tag "$RELEASE_TAG" \
+              '[.[] | select(.tag_name == $tag)] | length' "$releases_json")
+            test "$release_count" -le 1 || {
+              echo "Multiple GitHub releases use $RELEASE_TAG." >&2
+              exit 1
+            }
+            test "$release_count" -eq 1 || return 1
+            jq --arg tag "$RELEASE_TAG" \
+              '.[] | select(.tag_name == $tag)' "$releases_json" > "$release_json"
+          }
+
+          if ! load_release_by_tag; then
+            gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+              -f tag_name="$RELEASE_TAG" \
+              -f name="Dwell $RELEASE_TAG" \
+              -F draft=true \
+              -F generate_release_notes=true \
+              > "$release_json"
           fi
 
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
+          release_id=$(jq -r '.id' "$release_json")
+          [[ "$release_id" =~ ^[0-9]+$ ]] || {
+            echo "GitHub returned an invalid release ID: $release_id" >&2
+            exit 1
+          }
+          release_api="repos/$GITHUB_REPOSITORY/releases/$release_id"
           is_draft=$(jq -r '.draft' "$release_json")
           release_url=$(jq -r '.html_url' "$release_json")
           if test "$is_draft" = "true"; then
-            expected_names_json=$(jq -R -s \
-              'split("\n") | map(select(length > 0))' "$expected_names")
-            mapfile -t unexpected_asset_ids < <(
-              jq -r --argjson expected "$expected_names_json" \
-                '.assets[] | select(.name as $name | ($expected | index($name)) == null) | .id' \
-                "$release_json"
-            )
+            mapfile -t asset_ids < <(jq -r '.assets[].id' "$release_json")
 
-            for asset_id in "${unexpected_asset_ids[@]}"; do
+            for asset_id in "${asset_ids[@]}"; do
               [[ "$asset_id" =~ ^[0-9]+$ ]] || {
                 echo "GitHub returned an invalid release asset ID: $asset_id" >&2
                 exit 1
               }
-              current_is_draft=$(gh api \
-                "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')
+              current_is_draft=$(gh api "$release_api" --jq '.draft')
               test "$current_is_draft" = "true" || {
                 echo "Release was published while its draft assets were being repaired; refusing to mutate it." >&2
                 exit 1
@@ -499,18 +532,28 @@ jobs:
                 "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
             done
 
-            current_is_draft=$(gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')
+            current_is_draft=$(gh api "$release_api" --jq '.draft')
             test "$current_is_draft" = "true" || {
               echo "Release was published before its draft assets could be uploaded; refusing to mutate it." >&2
               exit 1
             }
-            gh release upload "$RELEASE_TAG" "${release_assets[@]}" --clobber
+            for artifact in "${release_assets[@]}"; do
+              asset_name=$(basename "$artifact")
+              encoded_name=$(jq -rn --arg value "$asset_name" '$value | @uri')
+              curl --fail-with-body --silent --show-error --location \
+                --request POST \
+                --header "Accept: application/vnd.github+json" \
+                --header "Authorization: Bearer $GH_TOKEN" \
+                --header "Content-Type: application/octet-stream" \
+                --header "X-GitHub-Api-Version: 2022-11-28" \
+                --data-binary "@$artifact" \
+                "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$release_id/assets?name=$encoded_name" \
+                > /dev/null
+            done
           fi
 
           verify_release_assets() {
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json" \
-              || return 1
+            gh api "$release_api" > "$release_json" || return 1
             jq -r '.assets[].name' "$release_json" | sort > "$RUNNER_TEMP/actual-release-assets.txt"
             cmp "$expected_names" "$RUNNER_TEMP/actual-release-assets.txt" || return 1
 
@@ -537,10 +580,13 @@ jobs:
           }
 
           if test "$is_draft" = "true"; then
-            current_is_draft=$(gh api \
-              "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.draft')
+            current_is_draft=$(gh api "$release_api" --jq '.draft')
             if test "$current_is_draft" = "true"; then
-              gh release edit "$RELEASE_TAG" --draft=false --title "Dwell $RELEASE_TAG"
+              gh api --method PATCH "$release_api" \
+                -f name="Dwell $RELEASE_TAG" \
+                -F draft=false \
+                > "$release_json"
+              release_url=$(jq -r '.html_url' "$release_json")
             fi
           fi
 
