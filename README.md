@@ -242,6 +242,7 @@ dwell setup --check
 dwell doctor
 dwell models list
 dwell models install ltx-2.5-bf16 --dry-run
+dwell models install ltx-2.5-q8 --dry-run
 dwell models install qwen3-coder-30b-a3b-4bit --dry-run
 dwell start
 dwell status
@@ -268,10 +269,20 @@ The registry distinguishes `registered`, `available`, `installed`, and `loaded`.
 states are `not_installed`, `installed`, `loading`, `loaded`, `unloading`, and `error`.
 
 The bundled registry records the locally established `mlx-community/ltx-2.5-mlx` bf16 repository.
-It also records `ltx-2.5-q8` as an unconfigured profile: Dwell has not verified a compatible q8
-repository, immutable revision, required-file set, and runtime behavior as one installable unit.
-Dwell will not invent or automatically enable a source. Set and test an explicit registry override
-in `~/.dwell/config/models.json` before attempting a real q8 installation.
+It also pins `ltx-2.5-q8` to the separately published mlx-community int8 Gemma-4 encoder tree and
+int8 distilled DiT snapshots. Dwell downloads only the required files, assembles both snapshots into
+one immutable local model view using symlinks, and runs it with low-memory scheduling. The selected
+files total approximately 43.4 GB (40.4 GiB); 24 GB unified memory is the conservative minimum and
+48 GB provides comfortable headroom for the default distilled pipeline.
+
+The two upstream repositories quantify different parts of LTX-2.5: `ltx-2.5-mlx-q8` contains the
+int8 text encoder and shared components, while `ltx-2.5-mlx-ditq8` supplies the int8 distilled DiT.
+Keeping both immutable revisions in the registry avoids treating either incomplete repository as a
+standalone model.
+
+On upgrade, Dwell recognizes the exact legacy unconfigured Q8 placeholder in
+`~/.dwell/config/models.json` and replaces only that entry in memory. Other local registry entries
+remain untouched; the override file itself is not rewritten.
 
 The registry also pins `qwen3-coder-30b-a3b-4bit` to the verified
 `mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit` snapshot. Install it explicitly with
