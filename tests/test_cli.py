@@ -10,6 +10,7 @@ from dwell import __version__
 from dwell import cli as cli_module
 from dwell.cli import app
 from dwell.setup import SetupMode, SetupReport
+from dwell.update import UpdateReport
 
 runner = CliRunner()
 
@@ -28,7 +29,17 @@ def test_help_and_command_tree() -> None:
     result = runner.invoke(app, ["--help"])
 
     assert result.exit_code == 0
-    for command in ("start", "stop", "setup", "doctor", "models", "jobs", "outputs", "config"):
+    for command in (
+        "start",
+        "stop",
+        "update",
+        "setup",
+        "doctor",
+        "models",
+        "jobs",
+        "outputs",
+        "config",
+    ):
         assert command in result.stdout
 
     version = runner.invoke(app, ["--version"])
@@ -159,6 +170,27 @@ def test_setup_cli_rejects_force_without_upgrade(tmp_path: Path) -> None:
     assert result.exit_code == 1
     assert "--force may only be used with --upgrade" in result.output
     assert not home.exists()
+
+
+def test_update_cli_reports_completed_update(tmp_path: Path, monkeypatch) -> None:
+    calls: list[tuple[Path, str]] = []
+
+    class FakeUpdateManager:
+        def __init__(self, config, *, current_version: str, reporter) -> None:
+            calls.append((config.home, current_version))
+            reporter("Updating safely")
+
+        def run(self) -> UpdateReport:
+            return UpdateReport("0.2.0", "0.2.1", True)
+
+    monkeypatch.setattr("dwell.update.UpdateManager", FakeUpdateManager)
+
+    result = runner.invoke(app, ["update"], env=_env(tmp_path / "dwell"))
+
+    assert result.exit_code == 0, result.output
+    assert calls == [(tmp_path / "dwell", __version__)]
+    assert "Updating safely" in result.stdout
+    assert "Dwell updated from 0.2.0 to 0.2.1" in result.stdout
 
 
 def test_missing_model_error_is_concise(tmp_path: Path) -> None:

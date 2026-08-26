@@ -324,6 +324,24 @@ def doctor() -> None:
 
 @app.command()
 @_handled
+def update() -> None:
+    """Update Dwell, its managed runtime, and restore the service state."""
+
+    from dwell.update import UpdateManager
+
+    report = UpdateManager(
+        _config(),
+        current_version=__version__,
+        reporter=typer.echo,
+    ).run()
+    if report.previous_version == report.installed_version:
+        typer.echo(f"✓ Dwell {report.installed_version} is current and healthy")
+    else:
+        typer.echo(f"✓ Dwell updated from {report.previous_version} to {report.installed_version}")
+
+
+@app.command()
+@_handled
 def setup(
     check: Annotated[
         bool,

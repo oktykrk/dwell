@@ -57,6 +57,7 @@ Install Dwell on an Apple Silicon Mac running macOS 14 Sonoma or newer with one 
 ```bash
 curl --proto '=https' --tlsv1.2 -fsSL \
   https://github.com/oktykrk/dwell/releases/latest/download/install.sh | sh
+dwell update
 ```
 
 Then use the CLI directly:
@@ -88,15 +89,20 @@ model weights or start the server. Model weights are downloaded only by the expl
 ### Updating
 
 ```bash
-curl --proto '=https' --tlsv1.2 -fsSL \
-  https://github.com/oktykrk/dwell/releases/latest/download/install.sh | sh
-dwell setup --upgrade
-dwell doctor
+dwell update
 ```
 
-The installer keeps the previous application version until the new version has passed its smoke
-test, then switches atomically. The setup upgrade updates the pinned video runtime while preserving
-models, generated outputs, and job data.
+The update command verifies and installs the latest release, preserves and replaces a locally
+modified managed runtime, runs diagnostics, and restores the previous running or stopped service
+state. The installer keeps the previous application version until the new version has passed its
+smoke test, then switches atomically. Models, generated outputs, and job data are preserved.
+
+Versions that predate the `dwell update` command need one final installer-based update:
+
+```bash
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://github.com/oktykrk/dwell/releases/latest/download/install.sh | sh
+```
 
 ### Uninstalling the application
 
