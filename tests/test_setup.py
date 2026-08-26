@@ -547,6 +547,56 @@ def test_archive_upgrade_refuses_a_modified_legacy_git_checkout(tmp_path: Path) 
     assert downloads == []
 
 
+def test_forced_archive_upgrade_preserves_and_replaces_dirty_runtime(tmp_path: Path) -> None:
+    source, commit = _source_repo(tmp_path)
+    config = DwellConfig(home=tmp_path / "home")
+    legacy_manager, _runner = _manager(config, _spec(source, commit))
+    legacy_manager.run()
+    local_change = legacy_manager.runtime_dir / "keep-me.txt"
+    local_change.write_text("user data\n", encoding="utf-8")
+    archive = _runtime_archive(tmp_path, commit, runtime_text="archive\n")
+    manager, _runner, downloads = _archive_manager(
+        config,
+        _archive_spec(archive, commit, repository=str(source)),
+        archive,
+    )
+
+    report = manager.run(SetupMode.UPGRADE, force=True)
+
+    backups = list(config.runtimes_dir.glob(".ltx-2-mlx.forced-backup-*"))
+    assert report.changed is True
+    assert report.healthy is True
+    assert len(backups) == 1
+    assert (backups[0] / "keep-me.txt").read_text(encoding="utf-8") == "user data\n"
+    assert (manager.runtime_dir / "runtime.txt").read_text(encoding="utf-8") == "archive\n"
+    assert downloads == [manager.runtime.archive_url]
+    assert any(str(backups[0]) in message for message in report.messages)
+
+
+def test_forced_archive_upgrade_restores_dirty_runtime_after_sync_failure(
+    tmp_path: Path,
+) -> None:
+    source, commit = _source_repo(tmp_path)
+    config = DwellConfig(home=tmp_path / "home")
+    legacy_manager, _runner = _manager(config, _spec(source, commit))
+    legacy_manager.run()
+    local_change = legacy_manager.runtime_dir / "keep-me.txt"
+    local_change.write_text("user data\n", encoding="utf-8")
+    archive = _runtime_archive(tmp_path, commit, runtime_text="archive\n")
+    manager, _runner, _downloads = _archive_manager(
+        config,
+        _archive_spec(archive, commit, repository=str(source)),
+        archive,
+        FakeRunner(fail_sync=True),
+    )
+
+    with pytest.raises(DwellError, match="previous runtime was restored"):
+        manager.run(SetupMode.UPGRADE, force=True)
+
+    assert local_change.read_text(encoding="utf-8") == "user data\n"
+    assert not list(config.runtimes_dir.glob(".ltx-2-mlx.forced-backup-*"))
+
+
 def test_clean_setup_installs_source_then_syncs_only_at_final_path(tmp_path: Path) -> None:
     source, commit = _source_repo(tmp_path)
     config = DwellConfig(home=tmp_path / "home")

@@ -199,8 +199,15 @@ dwell setup
 dwell setup --check
 dwell setup --repair
 dwell setup --upgrade
+dwell setup --upgrade --force
 dwell doctor
 ```
+
+`dwell setup --upgrade` refuses to replace a runtime with local or unsafe changes. If those
+changes are no longer meant to be active, `dwell setup --upgrade --force` installs the pinned,
+verified runtime and preserves the previous runtime in a timestamped hidden backup under
+`~/.dwell/runtimes/`. The force flag is accepted only together with `--upgrade`; setup still
+refuses to mutate a running Dwell service or an active LTX job.
 
 Model lifecycle:
 

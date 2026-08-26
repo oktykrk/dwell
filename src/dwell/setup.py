@@ -146,6 +146,7 @@ class MutationOutcome:
     messages: tuple[str, ...]
     backup: Path | None = None
     previous_inspection: RuntimeInspection | None = None
+    preserve_backup: bool = False
 
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
@@ -888,7 +889,9 @@ class SetupManager:
     def runtime_dir(self) -> Path:
         return self.config.runtimes_dir / self.runtime.id
 
-    def run(self, mode: SetupMode = SetupMode.INSTALL) -> SetupReport:
+    def run(self, mode: SetupMode = SetupMode.INSTALL, *, force: bool = False) -> SetupReport:
+        if force and mode != SetupMode.UPGRADE:
+            raise DwellError("invalid_request", "force is only valid for runtime upgrades.")
         messages = self._preflight()
         if mode == SetupMode.CHECK:
             # A read-only check must never import or execute code from the
@@ -916,19 +919,19 @@ class SetupManager:
         with self._setup_lock():
             self.config.ensure_layout()
             inspection = self.inspect(probe_venv=False)
-            if self._runtime_mutation_required(mode, inspection):
+            if self._runtime_mutation_required(mode, inspection, force=force):
                 # Match the lock order used by model removal (lifecycle, then
                 # LTX) and retain both leases for every runtime mutation.
                 with self._runtime_mutation_locks():
                     self._refuse_active_work()
                     # Re-inspect under the leases; the checkout may have changed
                     # while setup was waiting to acquire them.
-                    outcome = self._mutate(mode)
+                    outcome = self._mutate(mode, force=force)
                     checks, state_changed, completion_messages = self._complete_setup(outcome)
             else:
                 # Healthy no-ops and validation errors do not need to disrupt a
                 # running server. Never permit this unlocked path to mutate.
-                outcome = self._mutate(mode, inspection=inspection)
+                outcome = self._mutate(mode, inspection=inspection, force=force)
                 current = self.inspect(probe_venv=False)
                 if outcome.changed or current != inspection:
                     raise DwellError(
@@ -959,7 +962,11 @@ class SetupManager:
                     "Setup completed its file operations, but dwell doctor reported errors.",
                     details={"errors": failures},
                 )
-            if outcome.backup is not None and outcome.previous_inspection is not None:
+            if (
+                outcome.backup is not None
+                and outcome.previous_inspection is not None
+                and not outcome.preserve_backup
+            ):
                 self._require_runtime_unchanged(outcome.previous_inspection, outcome.backup)
             state_changed = not self._state_matches()
             if state_changed:
@@ -977,7 +984,9 @@ class SetupManager:
                 ) from exc
             raise
 
-        if outcome.backup is not None:
+        if outcome.backup is not None and outcome.preserve_backup:
+            messages.append(f"Previous runtime preserved at {outcome.backup}")
+        elif outcome.backup is not None:
             try:
                 shutil.rmtree(outcome.backup)
             except OSError as exc:
@@ -1393,9 +1402,11 @@ class SetupManager:
         self,
         mode: SetupMode,
         inspection: RuntimeInspection,
+        *,
+        force: bool = False,
     ) -> bool:
         if inspection.exists and inspection.dirty:
-            return False
+            return mode == SetupMode.UPGRADE and force and not self.runtime_dir.is_symlink()
         venv_is_symlink = (self.runtime_dir / ".venv").is_symlink()
         if venv_is_symlink:
             return False
@@ -1423,12 +1434,19 @@ class SetupManager:
         mode: SetupMode,
         *,
         inspection: RuntimeInspection | None = None,
+        force: bool = False,
     ) -> MutationOutcome:
         inspection = inspection or self.inspect(probe_venv=False)
-        if inspection.exists and inspection.dirty:
+        if self.runtime_dir.is_symlink():
+            raise DwellError(
+                "runtime_unhealthy",
+                "Refusing to replace a symlinked runtime path.",
+            )
+        if inspection.exists and inspection.dirty and not (mode == SetupMode.UPGRADE and force):
             raise DwellError(
                 "dirty_runtime",
-                "The LTX runtime has local or unsafe changes; setup refused to overwrite it.",
+                "The LTX runtime has local or unsafe changes; setup refused to overwrite it. "
+                "Use dwell setup --upgrade --force to preserve and replace it.",
                 details={"path": str(self.runtime_dir), "problems": inspection.problems},
             )
         if (self.runtime_dir / ".venv").is_symlink():
@@ -1439,7 +1457,7 @@ class SetupManager:
         if mode == SetupMode.REPAIR:
             return self._repair(inspection)
         if mode == SetupMode.UPGRADE:
-            return self._upgrade(inspection)
+            return self._upgrade(inspection, force=force)
         return self._install_missing(inspection)
 
     def _install_missing(self, inspection: RuntimeInspection) -> MutationOutcome:
@@ -1507,7 +1525,12 @@ class SetupManager:
         self._require_healthy_runtime()
         return MutationOutcome(True, ("Rebuilt and verified the runtime virtual environment",))
 
-    def _upgrade(self, inspection: RuntimeInspection) -> MutationOutcome:
+    def _upgrade(
+        self,
+        inspection: RuntimeInspection,
+        *,
+        force: bool = False,
+    ) -> MutationOutcome:
         if not inspection.exists:
             self._install_source()
             self._sync_runtime()
@@ -1522,7 +1545,12 @@ class SetupManager:
             return self._repair(inspection)
 
         staging = self._clone_staging()
-        backup = self.config.runtimes_dir / f".{self.runtime.id}.backup-{os.getpid()}"
+        preserving_dirty_runtime = force and inspection.dirty
+        if preserving_dirty_runtime:
+            timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+            backup = self.config.runtimes_dir / (f".{self.runtime.id}.forced-backup-{timestamp}")
+        else:
+            backup = self.config.runtimes_dir / f".{self.runtime.id}.backup-{os.getpid()}"
         if backup.exists() or backup.is_symlink():
             self._cleanup_staging(staging)
             raise DwellError(
@@ -1534,7 +1562,8 @@ class SetupManager:
             # Staging can take a long time. Recheck both active state and the
             # exact checkout identity immediately before replacing anything.
             self._refuse_active_work()
-            self._require_runtime_unchanged(inspection, self.runtime_dir)
+            if not preserving_dirty_runtime:
+                self._require_runtime_unchanged(inspection, self.runtime_dir)
             os.replace(self.runtime_dir, backup)
             moved_old = True
             os.replace(staging, self.runtime_dir)
@@ -1543,7 +1572,8 @@ class SetupManager:
             self._require_healthy_runtime()
             # Preserve edits made through an already-open handle after the
             # checkout was renamed to its backup path.
-            self._require_runtime_unchanged(inspection, backup)
+            if not preserving_dirty_runtime:
+                self._require_runtime_unchanged(inspection, backup)
         except BaseException as exc:
             rollback_error: Exception | None = None
             try:
@@ -1579,7 +1609,8 @@ class SetupManager:
             True,
             (f"Upgraded {self.runtime.id} to {self.runtime.commit}",),
             backup=backup,
-            previous_inspection=inspection,
+            previous_inspection=None if preserving_dirty_runtime else inspection,
+            preserve_backup=preserving_dirty_runtime,
         )
 
     def _refuse_active_work(self) -> None:

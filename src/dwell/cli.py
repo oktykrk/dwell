@@ -337,6 +337,13 @@ def setup(
         bool,
         typer.Option("--upgrade", help="Move a clean runtime to the current manifest commit."),
     ] = False,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Replace a dirty runtime during --upgrade, preserving it as a backup.",
+        ),
+    ] = False,
 ) -> None:
     """Prepare or verify the per-user LTX runtime without downloading models."""
 
@@ -344,6 +351,8 @@ def setup(
 
     if sum((check, repair, upgrade)) > 1:
         raise DwellError("invalid_request", "Use only one of --check, --repair, or --upgrade.")
+    if force and not upgrade:
+        raise DwellError("invalid_request", "--force may only be used with --upgrade.")
     mode = (
         SetupMode.CHECK
         if check
@@ -353,7 +362,7 @@ def setup(
         if upgrade
         else SetupMode.INSTALL
     )
-    report = SetupManager(_config()).run(mode)
+    report = SetupManager(_config()).run(mode, force=force)
     for message in report.messages:
         typer.echo(message)
     if report.doctor_checks:
