@@ -469,10 +469,9 @@ installation, and process management without model weights. Do not run a real
 
 Releases never run automatically on a commit or tag push. In GitHub Actions, open the **Release**
 workflow, choose **Run workflow** from `main`, select a `patch`, `minor`, or `major` semantic
-version bump, and select **publish**. The workflow updates the version in `pyproject.toml` and
-`uv.lock`, commits that change to `main`, and publishes the resulting version. Leaving **publish**
-unselected previews the version bump and performs the complete project, package, installer, and
-checksum validation without changing the remote repository.
+version bump, and run the workflow. The workflow validates the project, updates the version in
+`pyproject.toml` and `uv.lock`, commits that change to `main`, and publishes the resulting version.
+If validation fails, it does not create the version commit, tag, or GitHub Release.
 
 A publishing run validates the selected `main` commit with the generated version change, pushes a
 dedicated version commit, uses that commit as the immutable release source, and creates its

@@ -14,12 +14,6 @@ on:
           - patch
           - minor
           - major
-      publish:
-        description: Create or resume the immutable tag and GitHub Release
-        required: true
-        default: false
-        type: boolean
-
 permissions:
   contents: read
 
@@ -285,7 +279,6 @@ jobs:
           )
 
       - name: Save validated release assets
-        if: inputs.publish
         uses: actions/upload-artifact@v7.0.1
         with:
           name: dwell-release-${{ steps.release.outputs.release_version }}
@@ -294,14 +287,7 @@ jobs:
           retention-days: 7
           path: dist/
 
-      - name: Summarize validation-only run
-        if: ${{ !inputs.publish }}
-        run: |
-          echo "Release $RELEASE_TAG passed lock, test, package, and installer validation."
-          echo "Nothing was pushed because publish was not selected."
-
   publish:
-    if: inputs.publish
     needs: validate
     runs-on: ubuntu-latest
     timeout-minutes: 10
