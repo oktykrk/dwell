@@ -1,14 +1,19 @@
 name: Release
 
-run-name: Release v${{ inputs.version }}
+run-name: Release (${{ inputs.bump }} bump)
 
 on:
   workflow_dispatch:
     inputs:
-      version:
-        description: Version from pyproject.toml, without the leading v (for example, 0.1.0)
+      bump:
+        description: Semantic version increment to apply
         required: true
-        type: string
+        default: patch
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
       publish:
         description: Create or resume the immutable tag and GitHub Release
         required: true
@@ -31,10 +36,11 @@ jobs:
       mode: ${{ steps.release.outputs.mode }}
       release_sha: ${{ steps.release.outputs.release_sha }}
       release_tag: ${{ steps.release.outputs.release_tag }}
+      release_version: ${{ steps.release.outputs.release_version }}
     env:
       DISPATCH_REF: ${{ github.ref }}
       HF_HUB_OFFLINE: "1"
-      RELEASE_VERSION: ${{ inputs.version }}
+      RELEASE_BUMP: ${{ inputs.bump }}
       TRANSFORMERS_OFFLINE: "1"
 
     steps:
@@ -45,8 +51,17 @@ jobs:
           persist-credentials: false
           ref: ${{ github.sha }}
 
-      - name: Resolve and verify release request
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.11.32"
+          python-version: "3.11.15"
+          enable-cache: true
+
+      - name: Resolve and prepare release version
         id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
@@ -55,62 +70,115 @@ jobs:
             echo "Run this workflow from the main branch." >&2
             exit 1
           }
-
-          [[ "$RELEASE_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
-            echo "Invalid release version: $RELEASE_VERSION" >&2
+          [[ "$RELEASE_BUMP" =~ ^(major|minor|patch)$ ]] || {
+            echo "Invalid release bump: $RELEASE_BUMP" >&2
             exit 1
           }
 
           dispatch_sha=$(git rev-parse HEAD)
           test "$dispatch_sha" = "$GITHUB_SHA"
-          release_tag="v$RELEASE_VERSION"
-          tag_ref="refs/tags/$release_tag"
+          current_version=$(uv version --short)
+          [[ "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Invalid project version: $current_version" >&2
+            exit 1
+          }
 
-          if git show-ref --verify --quiet "$tag_ref"; then
-            test "$(git cat-file -t "$tag_ref")" = "tag" || {
-              echo "Existing $release_tag is not an annotated release tag." >&2
-              exit 1
-            }
-            release_sha=$(git rev-list -n 1 "$tag_ref")
-            git merge-base --is-ancestor "$release_sha" "$dispatch_sha" || {
-              echo "Existing $release_tag is not in the selected main history." >&2
-              exit 1
-            }
-            mode="resume"
-          else
-            release_sha="$dispatch_sha"
+          current_tag="v$current_version"
+          current_tag_ref="refs/tags/$current_tag"
+          release_sha="$dispatch_sha"
+
+          prepare_new_release() {
             mode="new"
+            uv version --bump "$RELEASE_BUMP" --no-sync
+            release_version=$(uv version --short)
+            release_tag="v$release_version"
+            release_tag_ref="refs/tags/$release_tag"
+            ! git show-ref --verify --quiet "$release_tag_ref" || {
+              echo "$release_tag already exists; update the project version before retrying." >&2
+              exit 1
+            }
+
+            mapfile -t changed_files < <(git diff --name-only | sort)
+            test "$(printf '%s\n' "${changed_files[@]}")" = \
+              "$(printf '%s\n' pyproject.toml uv.lock | sort)" || {
+              echo "Version bump changed unexpected files." >&2
+              printf '%s\n' "${changed_files[@]}" >&2
+              exit 1
+            }
+          }
+
+          if git show-ref --verify --quiet "$current_tag_ref"; then
+            test "$(git cat-file -t "$current_tag_ref")" = "tag" || {
+              echo "Existing $current_tag is not an annotated release tag." >&2
+              exit 1
+            }
+            current_release_sha=$(git rev-list -n 1 "$current_tag_ref")
+            git merge-base --is-ancestor "$current_release_sha" "$dispatch_sha" || {
+              echo "Existing $current_tag is not in the selected main history." >&2
+              exit 1
+            }
+
+            release_state="missing"
+            if release_json=$(gh api \
+              "repos/$GITHUB_REPOSITORY/releases/tags/$current_tag" 2>/dev/null); then
+              if test "$(jq -r '.draft' <<< "$release_json")" = "true"; then
+                release_state="draft"
+              else
+                release_state="published"
+              fi
+            fi
+
+            if test "$release_state" = "published"; then
+              prepare_new_release
+            else
+              mode="resume"
+              release_version="$current_version"
+              release_tag="$current_tag"
+              release_sha="$current_release_sha"
+              git checkout --detach "$release_sha"
+            fi
+          else
+            head_subject=$(git show -s --format=%s HEAD)
+            head_author_email=$(git show -s --format=%ae HEAD)
+            mapfile -t head_files < <(git diff-tree --no-commit-id --name-only -r HEAD | sort)
+            if test "$head_subject" = "Release $current_tag" \
+              && test "$head_author_email" = \
+                "41898282+github-actions[bot]@users.noreply.github.com" \
+              && test "$(printf '%s\n' "${head_files[@]}")" = \
+                "$(printf '%s\n' pyproject.toml uv.lock | sort)"; then
+              # A previous run pushed the version commit but did not create the
+              # tag. Reuse that commit instead of bumping twice.
+              mode="prepared"
+              release_version="$current_version"
+              release_tag="$current_tag"
+            else
+              prepare_new_release
+            fi
           fi
 
-          project_version=$(git show "$release_sha:pyproject.toml" \
-            | sed -n 's/^version = "\([^"]*\)"/\1/p' \
-            | head -n 1)
-          test -n "$project_version"
-          test "$RELEASE_VERSION" = "$project_version" || {
-            echo "Requested version $RELEASE_VERSION does not match release source ($project_version)." >&2
+          project_version=$(uv version --short)
+          test "$release_version" = "$project_version" || {
+            echo "Prepared version $project_version does not match $release_version." >&2
             exit 1
           }
 
           source_date_epoch=$(git show -s --format=%ct "$release_sha")
           test -n "$source_date_epoch"
 
-          echo "RELEASE_MODE=$mode" >> "$GITHUB_ENV"
-          echo "RELEASE_SHA=$release_sha" >> "$GITHUB_ENV"
-          echo "RELEASE_TAG=$release_tag" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH=$source_date_epoch" >> "$GITHUB_ENV"
-          echo "dispatch_sha=$dispatch_sha" >> "$GITHUB_OUTPUT"
-          echo "mode=$mode" >> "$GITHUB_OUTPUT"
-          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
-
-          git checkout --detach "$release_sha"
-
-      - name: Install uv and Python
-        uses: astral-sh/setup-uv@v9.0.0
-        with:
-          version: "0.11.32"
-          python-version: "3.11.15"
-          enable-cache: true
+          {
+            echo "RELEASE_MODE=$mode"
+            echo "RELEASE_SHA=$release_sha"
+            echo "RELEASE_TAG=$release_tag"
+            echo "RELEASE_VERSION=$release_version"
+            echo "SOURCE_DATE_EPOCH=$source_date_epoch"
+          } >> "$GITHUB_ENV"
+          {
+            echo "dispatch_sha=$dispatch_sha"
+            echo "mode=$mode"
+            echo "release_sha=$release_sha"
+            echo "release_tag=$release_tag"
+            echo "release_version=$release_version"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Install locked development environment
         run: uv sync --locked --all-groups
@@ -170,7 +238,10 @@ jobs:
           grep -E '^mlx-lm==0\.31\.3 ' "dist/$requirements" \
             | grep -F "platform_machine == 'arm64'" \
             | grep -F "sys_platform == 'darwin'"
-          ! grep -E '^(dwell-ai|pytest(-asyncio)?|ruff)==' "dist/$requirements"
+          if grep -E '^(dwell-ai|pytest(-asyncio)?|ruff)==' "dist/$requirements"; then
+            echo "Development dependency found in release requirements." >&2
+            exit 1
+          fi
 
           # uv treats --no-build and --only-binary :all: as mutually exclusive;
           # the latter provides the stronger wheel-only validation.
@@ -217,7 +288,7 @@ jobs:
         if: inputs.publish
         uses: actions/upload-artifact@v7.0.1
         with:
-          name: dwell-release-${{ inputs.version }}
+          name: dwell-release-${{ steps.release.outputs.release_version }}
           if-no-files-found: error
           overwrite: true
           retention-days: 7
@@ -238,9 +309,11 @@ jobs:
       contents: write
     env:
       DISPATCH_SHA: ${{ needs.validate.outputs.dispatch_sha }}
+      RELEASE_BUMP: ${{ inputs.bump }}
       RELEASE_MODE: ${{ needs.validate.outputs.mode }}
       RELEASE_SHA: ${{ needs.validate.outputs.release_sha }}
       RELEASE_TAG: ${{ needs.validate.outputs.release_tag }}
+      RELEASE_VERSION: ${{ needs.validate.outputs.release_version }}
 
     steps:
       - name: Check out the verified main commit
@@ -249,10 +322,17 @@ jobs:
           fetch-depth: 0
           ref: ${{ needs.validate.outputs.dispatch_sha }}
 
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          version: "0.11.32"
+          python-version: "3.11.15"
+          enable-cache: true
+
       - name: Download validated release assets
         uses: actions/download-artifact@v8.0.1
         with:
-          name: dwell-release-${{ inputs.version }}
+          name: dwell-release-${{ needs.validate.outputs.release_version }}
           path: ${{ runner.temp }}/dwell-release
 
       - name: Verify downloaded release assets
@@ -294,7 +374,7 @@ jobs:
             "$(printf '%s\n' "${expected_payloads[@]}" | sort)"
           (cd "$release_dir" && sha256sum --check SHA256SUMS)
 
-      - name: Publish or verify immutable release tag
+      - name: Publish version commit and immutable release tag
         shell: bash
         run: |
           set -euo pipefail
@@ -302,14 +382,45 @@ jobs:
           test "$(git rev-parse HEAD)" = "$DISPATCH_SHA"
           git fetch origin "+refs/heads/main:refs/remotes/origin/main"
           remote_main=$(git rev-parse refs/remotes/origin/main)
-          git merge-base --is-ancestor "$RELEASE_SHA" "$DISPATCH_SHA" || {
-            echo "The release commit is not in the selected main history." >&2
-            exit 1
-          }
-          git merge-base --is-ancestor "$DISPATCH_SHA" "$remote_main" || {
-            echo "The selected release commit is no longer in main history." >&2
-            exit 1
-          }
+
+          if test "$RELEASE_MODE" = "new"; then
+            test "$remote_main" = "$DISPATCH_SHA" || {
+              echo "main advanced after validation; rerun the release from the latest main." >&2
+              exit 1
+            }
+
+            uv version --bump "$RELEASE_BUMP" --no-sync
+            test "$(uv version --short)" = "$RELEASE_VERSION"
+            mapfile -t changed_files < <(git diff --name-only | sort)
+            test "$(printf '%s\n' "${changed_files[@]}")" = \
+              "$(printf '%s\n' pyproject.toml uv.lock | sort)" || {
+              echo "Recreated version bump changed unexpected files." >&2
+              printf '%s\n' "${changed_files[@]}" >&2
+              exit 1
+            }
+
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add pyproject.toml uv.lock
+            git commit -m "Release $RELEASE_TAG"
+            RELEASE_SHA=$(git rev-parse HEAD)
+            git push origin "HEAD:refs/heads/main"
+          elif test "$RELEASE_MODE" = "prepared"; then
+            test "$remote_main" = "$DISPATCH_SHA" || {
+              echo "main advanced after validation; rerun the release from the latest main." >&2
+              exit 1
+            }
+            test "$(uv version --short)" = "$RELEASE_VERSION"
+            RELEASE_SHA="$DISPATCH_SHA"
+          else
+            test "$RELEASE_MODE" = "resume"
+            git merge-base --is-ancestor "$RELEASE_SHA" "$remote_main" || {
+              echo "The release commit is no longer in main history." >&2
+              exit 1
+            }
+          fi
+
+          echo "RELEASE_SHA=$RELEASE_SHA" >> "$GITHUB_ENV"
 
           tag_ref="refs/tags/$RELEASE_TAG"
           remote_refs=$(git ls-remote --tags origin "$tag_ref" "$tag_ref^{}")
@@ -319,7 +430,7 @@ jobs:
             | awk -v ref="$tag_ref^{}" '$2 == ref { print $1 }')
 
           if test -z "$remote_tag"; then
-            test "$RELEASE_MODE" = "new" || {
+            test "$RELEASE_MODE" != "resume" || {
               echo "The existing $RELEASE_TAG disappeared after validation." >&2
               exit 1
             }
@@ -375,6 +486,7 @@ jobs:
 
           gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" > "$release_json"
           is_draft=$(jq -r '.draft' "$release_json")
+          release_url=$(jq -r '.html_url' "$release_json")
           if test "$is_draft" = "true"; then
             expected_names_json=$(jq -R -s \
               'split("\n") | map(select(length > 0))' "$expected_names")
@@ -444,5 +556,4 @@ jobs:
             fi
           fi
 
-          release_url=$(gh release view "$RELEASE_TAG" --json url --jq .url)
           echo "Published or verified $RELEASE_TAG from $RELEASE_SHA: $release_url"
