@@ -6,6 +6,7 @@ from typing import Any
 
 from typer.testing import CliRunner
 
+from dwell import __version__
 from dwell import cli as cli_module
 from dwell.cli import app
 from dwell.setup import SetupMode, SetupReport
@@ -32,7 +33,7 @@ def test_help_and_command_tree() -> None:
 
     version = runner.invoke(app, ["--version"])
     assert version.exit_code == 0
-    assert version.stdout == "Dwell 0.1.0\n"
+    assert version.stdout == f"Dwell {__version__}\n"
 
 
 def test_config_status_jobs_and_outputs_without_server(tmp_path: Path) -> None:

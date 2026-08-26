@@ -468,19 +468,22 @@ installation, and process management without model weights. Do not run a real
 ## Maintainer release
 
 Releases never run automatically on a commit or tag push. In GitHub Actions, open the **Release**
-workflow, choose **Run workflow** from `main`, enter the version already recorded in
-`pyproject.toml`, and select **publish**. Leaving **publish** unselected performs the complete
-project, package, installer, and checksum validation without changing the remote repository.
+workflow, choose **Run workflow** from `main`, select a `patch`, `minor`, or `major` semantic
+version bump, and select **publish**. The workflow updates the version in `pyproject.toml` and
+`uv.lock`, commits that change to `main`, and publishes the resulting version. Leaving **publish**
+unselected previews the version bump and performs the complete project, package, installer, and
+checksum validation without changing the remote repository.
 
-A publishing run captures the selected `main` commit as the immutable release source, creates its
-annotated `v<version>` tag without force, and publishes the wheel, source distribution, locked
-macOS requirements, installer, and `SHA256SUMS`. The release workflow uses an Ubuntu runner and
-prebuilt packages; it does not build a Homebrew formula or bottle.
+A publishing run validates the selected `main` commit with the generated version change, pushes a
+dedicated version commit, uses that commit as the immutable release source, and creates its
+annotated `v<version>` tag without force. It publishes the wheel, source distribution, locked macOS
+requirements, installer, and `SHA256SUMS`. The release workflow uses an Ubuntu runner and prebuilt
+packages; it does not build a Homebrew formula or bottle.
 
 Normal CI continues to validate development commits and pull requests, but it never publishes
-them. If a publishing run is interrupted, dispatch the same version again. The workflow verifies
-the existing tag and asset digests, repairs an incomplete draft, and never overwrites an already
-published release.
+them. If a publishing run is interrupted, dispatch the same bump again. The workflow resumes an
+untagged version commit or incomplete release, verifies the existing tag and asset digests, repairs
+an incomplete draft, and never overwrites an already published release.
 
 ## Managed FFmpeg
 

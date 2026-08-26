@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import httpx
 import pytest
 
+from dwell import __version__
 from dwell import setup as dwell_setup_module
 from dwell.config import DwellConfig
 from dwell.doctor import CheckLevel, DoctorCheck
@@ -330,7 +331,7 @@ def test_default_archive_downloader_streams_and_verifies_https(
     assert calls[0][2]["follow_redirects"] is True
     assert calls[0][2]["headers"] == {
         "Accept-Encoding": "identity",
-        "User-Agent": "dwell/0.1.0",
+        "User-Agent": f"dwell/{__version__}",
     }
 
 
@@ -610,7 +611,7 @@ def test_clean_setup_installs_source_then_syncs_only_at_final_path(tmp_path: Pat
     assert runner.sync_directories == [manager.runtime_dir]
     assert (manager.runtime_dir / ".venv/bin/ltx-2-mlx").is_file()
     state = json.loads(config.setup_state_file.read_text(encoding="utf-8"))
-    assert state["dwell_version"] == "0.1.0"
+    assert state["dwell_version"] == __version__
     assert state["runtime"]["commit"] == commit
     assert not any(config.models_dir.rglob("*.safetensors"))
 
