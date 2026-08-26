@@ -58,6 +58,16 @@ class RuntimeCapabilities(BaseModel):
     tool_calling: bool = False
 
 
+class SupplementalWeightSource(BaseModel):
+    """An immutable Hugging Face snapshot merged into a primary model tree."""
+
+    model_config = ConfigDict(frozen=True)
+
+    repository: str
+    revision: str
+    required_files: tuple[str, ...]
+
+
 class WeightSource(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -69,6 +79,7 @@ class WeightSource(BaseModel):
     license_url: str | None = None
     acceptable_use_url: str | None = None
     notes: str | None = None
+    supplemental_sources: tuple[SupplementalWeightSource, ...] = ()
 
 
 class ModelProfile(BaseModel):

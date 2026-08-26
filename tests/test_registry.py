@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -8,10 +9,16 @@ from types import SimpleNamespace
 import pytest
 
 from dwell.config import DwellConfig
-from dwell.domain import Modality, ModelDefinition, ModelProfile, WeightSource
-from dwell.errors import DwellError
+from dwell.domain import (
+    Modality,
+    ModelDefinition,
+    ModelProfile,
+    SupplementalWeightSource,
+    WeightSource,
+)
 from dwell.model_manager import ModelManager
 from dwell.registry import ModelRegistry
+from dwell.runtimes.ltx import LTXSubprocessRuntime
 
 REVISION = "a" * 40
 
@@ -40,7 +47,7 @@ def _snapshot(config: DwellConfig) -> tuple[Path, Path]:
     return repo, snapshot
 
 
-def test_bundled_registry_is_truthful_about_unconfigured_q8(tmp_path: Path) -> None:
+def test_bundled_q8_has_pinned_composite_sources(tmp_path: Path) -> None:
     config = DwellConfig(home=tmp_path / "dwell")
     registry = ModelRegistry.load(config)
     manager = ModelManager(config, registry=registry)
@@ -51,13 +58,41 @@ def test_bundled_registry_is_truthful_about_unconfigured_q8(tmp_path: Path) -> N
         "qwen3-coder-30b-a3b-4bit",
     ]
     plan = manager.install_plan("ltx-2.5-q8")
-    assert plan.downloadable is False
-    assert plan.repository is None
+    assert plan.downloadable is True
+    assert plan.repository == "mlx-community/ltx-2.5-mlx-q8"
+    assert plan.revision == "3a80fb22703ef1ca69a89c8f65462b9456b6a361"
+    assert plan.supplemental_sources[0].repository == "mlx-community/ltx-2.5-mlx-ditq8"
+    assert plan.supplemental_sources[0].revision == ("5724211c8d1600f15062c9c9667440325f252220")
+    assert plan.estimated_size_gb == 43.4
+    assert plan.minimum_memory_gb == 24.0
     assert plan.already_installed is False
     assert not config.home.exists(), "offline planning must not create operational state"
 
-    with pytest.raises(DwellError, match="no verified install source"):
-        manager.install("ltx-2.5-q8")
+
+def test_exact_legacy_q8_placeholder_is_upgraded_in_memory(tmp_path: Path) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    bundled = ModelRegistry.load(config)
+    document = {
+        "schema_version": 1,
+        "models": [definition.model_dump(mode="json") for definition in bundled.list()],
+    }
+    q8 = next(model for model in document["models"] if model["id"] == "ltx-2.5-q8")
+    q8["weights"] = {
+        "provider": "unconfigured",
+        "repository": None,
+        "revision": None,
+        "required_files": [],
+        "estimated_size_gb": None,
+        "notes": "Registered placeholder only. No quantized sibling is published.",
+    }
+    config.registry_file.parent.mkdir(parents=True)
+    config.registry_file.write_text(json.dumps(document), encoding="utf-8")
+
+    migrated = ModelRegistry.load(config)
+
+    assert migrated.source_path == config.registry_file
+    assert migrated.get("ltx-2.5-q8").weights.repository == "mlx-community/ltx-2.5-mlx-q8"
+    assert '"provider": "unconfigured"' in config.registry_file.read_text(encoding="utf-8")
 
 
 def test_bundled_bf16_install_plan_has_verified_size_and_usage_terms(tmp_path: Path) -> None:
@@ -182,3 +217,108 @@ def test_explicit_install_pins_hub_and_xet_caches_under_dwell_home(
     assert os.environ.get("HF_HOME") == previous_home
     assert os.environ.get("HF_HUB_CACHE") == previous_hub
     assert os.environ["HF_XET_CACHE"] == str(tmp_path / "outside")
+
+
+def test_composite_install_downloads_and_assembles_all_snapshots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    definition = ModelDefinition(
+        id="composite-video",
+        family="test",
+        version="1",
+        modality=Modality.VIDEO,
+        runtime="ltx-2-mlx",
+        weights=WeightSource(
+            provider="huggingface",
+            repository="example/components",
+            revision="b" * 40,
+            required_files=("config.json", "gemma/*.safetensors"),
+            supplemental_sources=(
+                SupplementalWeightSource(
+                    repository="example/transformer",
+                    revision="c" * 40,
+                    required_files=("transformer-distilled.safetensors",),
+                ),
+            ),
+        ),
+        profile=ModelProfile(quantization="q8"),
+    )
+    registry = ModelRegistry(config, definitions=[definition])
+    manager = ModelManager(config, registry=registry)
+    calls: list[tuple[str, str, tuple[str, ...]]] = []
+
+    def fake_snapshot_download(**kwargs: object) -> None:
+        repository = str(kwargs["repo_id"])
+        revision = str(kwargs["revision"])
+        required = tuple(kwargs["allow_patterns"])  # type: ignore[arg-type]
+        calls.append((repository, revision, required))
+        snapshot = registry.huggingface_repo_dir(repository) / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        if repository == "example/components":
+            (snapshot / "config.json").write_text("{}", encoding="utf-8")
+            (snapshot / "gemma").mkdir()
+            (snapshot / "gemma/model.safetensors").write_bytes(b"encoder")
+        else:
+            (snapshot / "transformer-distilled.safetensors").write_bytes(b"dit")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    result = manager.install(definition.id)
+
+    assert result.installed is True
+    assembled = registry.resolve_local_path(definition.id)
+    assert assembled == registry.composite_model_dir(definition.id).resolve()
+    assert (assembled / "config.json").is_symlink()
+    assert (assembled / "gemma/model.safetensors").read_bytes() == b"encoder"
+    assert (assembled / "transformer-distilled.safetensors").read_bytes() == b"dit"
+    assert calls == [
+        ("example/components", "b" * 40, ("config.json", "gemma/*.safetensors")),
+        ("example/transformer", "c" * 40, ("transformer-distilled.safetensors",)),
+    ]
+
+
+def test_bundled_q8_composite_matches_ltx_runtime_layout(tmp_path: Path) -> None:
+    config = DwellConfig(home=tmp_path / "dwell")
+    registry = ModelRegistry.load(config)
+    manager = ModelManager(config, registry=registry)
+    model_id = "ltx-2.5-q8"
+
+    for repository, revision, required_files in registry.huggingface_snapshots(model_id):
+        snapshot = registry.huggingface_repo_dir(repository) / "snapshots" / revision
+        snapshot.mkdir(parents=True)
+        for required in required_files:
+            if required == "gemma4-12b-ltx-v1/*.safetensors":
+                for shard in range(1, 4):
+                    path = snapshot / (f"gemma4-12b-ltx-v1/model-{shard:05d}-of-00003.safetensors")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"weights")
+                continue
+            if required == "gemma4-12b-ltx-v1/model.safetensors.index.json":
+                path = snapshot / required
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    '{"weight_map": {'
+                    '"a": "model-00001-of-00003.safetensors", '
+                    '"b": "model-00002-of-00003.safetensors", '
+                    '"c": "model-00003-of-00003.safetensors"}}',
+                    encoding="utf-8",
+                )
+                continue
+            path = snapshot / required
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"data")
+
+    manager._assemble_composite(model_id)
+    assembled = registry.resolve_local_path(model_id)
+    adapter = LTXSubprocessRuntime(config, registry.resolve_local_path)
+
+    model_path, gemma_path = adapter._validated_model_paths(model_id, assembled)
+
+    assert model_path == assembled
+    assert gemma_path == assembled / "gemma4-12b-ltx-v1"

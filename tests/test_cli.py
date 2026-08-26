@@ -69,7 +69,8 @@ def test_model_list_info_and_install_dry_runs_are_offline(tmp_path: Path) -> Non
 
     result = runner.invoke(app, ["models", "info", "ltx-2.5-q8"], env=env)
     assert result.exit_code == 0, result.output
-    assert "source: not configured" in result.stdout
+    assert "source: mlx-community/ltx-2.5-mlx-q8" in result.stdout
+    assert "supplemental_source_1: mlx-community/ltx-2.5-mlx-ditq8" in result.stdout
     assert "install_state: not_installed" in result.stdout
 
     result = runner.invoke(
@@ -78,7 +79,10 @@ def test_model_list_info_and_install_dry_runs_are_offline(tmp_path: Path) -> Non
         env=env,
     )
     assert result.exit_code == 0, result.output
-    assert "Source: not configured" in result.stdout
+    assert "Source: mlx-community/ltx-2.5-mlx-q8" in result.stdout
+    assert "Supplemental source 1: mlx-community/ltx-2.5-mlx-ditq8" in result.stdout
+    assert "Approximate size: 43.4 GB" in result.stdout
+    assert "Downloadable: yes" in result.stdout
     assert "no download was performed" in result.stdout
 
     result = runner.invoke(

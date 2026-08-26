@@ -4,6 +4,7 @@ import json
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
+from hashlib import sha256
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -98,7 +99,12 @@ class ModelRegistry:
     def source_available(self, model_id: str) -> bool:
         source = self.get(model_id).weights
         if source.provider == "huggingface":
-            return bool(source.repository and source.revision and source.required_files)
+            primary = bool(source.repository and source.revision and source.required_files)
+            supplemental = all(
+                item.repository and item.revision and item.required_files
+                for item in source.supplemental_sources
+            )
+            return primary and supplemental
         if source.provider == "local":
             return bool(source.repository and source.required_files)
         return False
@@ -110,6 +116,8 @@ class ModelRegistry:
             return LocalModelInstallation(model_id, False, False, None)
         if source.provider == "local":
             return self._inspect_local_source(definition)
+        if source.supplemental_sources:
+            return self._inspect_composite_source(definition)
         return self._inspect_huggingface_source(definition)
 
     def resolve_local_path(self, model_id: str) -> Path:
@@ -152,10 +160,12 @@ class ModelRegistry:
         )
 
     def _read_registry(self, requested_path: Path | None) -> tuple[Any, Path | None]:
+        migrate_legacy_q8 = False
         if requested_path is not None:
             source = Path(requested_path).expanduser()
         elif self.config.registry_file.is_file():
             source = self.config.registry_file
+            migrate_legacy_q8 = True
         else:
             source = None
 
@@ -164,9 +174,41 @@ class ModelRegistry:
                 text = files("dwell.data").joinpath("models.json").read_text(encoding="utf-8")
             else:
                 text = source.read_text(encoding="utf-8")
-            return json.loads(text), source
+            raw = json.loads(text)
+            if migrate_legacy_q8:
+                raw = self._migrate_legacy_q8_placeholder(raw)
+            return raw, source
         except (OSError, json.JSONDecodeError) as exc:
             raise self._invalid_registry(str(source or "bundled models.json"), exc) from exc
+
+    @staticmethod
+    def _migrate_legacy_q8_placeholder(raw: Any) -> Any:
+        if not isinstance(raw, dict) or not isinstance(raw.get("models"), list):
+            return raw
+        models = raw["models"]
+        legacy_index = next(
+            (
+                index
+                for index, model in enumerate(models)
+                if isinstance(model, dict)
+                and model.get("id") == "ltx-2.5-q8"
+                and isinstance(model.get("weights"), dict)
+                and model["weights"].get("provider") == "unconfigured"
+                and model["weights"].get("repository") is None
+                and model["weights"].get("revision") is None
+                and model["weights"].get("required_files") == []
+                and "Registered placeholder only" in str(model["weights"].get("notes", ""))
+            ),
+            None,
+        )
+        if legacy_index is None:
+            return raw
+
+        bundled = json.loads(
+            files("dwell.data").joinpath("models.json").read_text(encoding="utf-8")
+        )
+        replacement = next(model for model in bundled["models"] if model.get("id") == "ltx-2.5-q8")
+        return {**raw, "models": [*models[:legacy_index], replacement, *models[legacy_index + 1 :]]}
 
     def _parse_document(
         self,
@@ -196,15 +238,27 @@ class ModelRegistry:
         )
 
     def _validate_definition_paths(self, definition: ModelDefinition) -> None:
-        for required in definition.weights.required_files:
-            candidate = Path(required)
-            if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
-                raise self._invalid_registry(
-                    str(self.source_path or "in-memory definitions"),
-                    ValueError(
-                        f"model '{definition.id}' has unsafe required file path: {required!r}"
-                    ),
-                )
+        source = definition.weights
+        if source.supplemental_sources and source.provider != "huggingface":
+            raise self._invalid_registry(
+                str(self.source_path or "in-memory definitions"),
+                ValueError(
+                    f"model '{definition.id}' has supplemental sources without a "
+                    "Hugging Face primary source"
+                ),
+            )
+        manifests = [source.required_files]
+        manifests.extend(item.required_files for item in source.supplemental_sources)
+        for manifest in manifests:
+            for required in manifest:
+                candidate = Path(required)
+                if candidate.is_absolute() or ".." in candidate.parts or not candidate.parts:
+                    raise self._invalid_registry(
+                        str(self.source_path or "in-memory definitions"),
+                        ValueError(
+                            f"model '{definition.id}' has unsafe required file path: {required!r}"
+                        ),
+                    )
 
     def _inspect_local_source(self, definition: ModelDefinition) -> LocalModelInstallation:
         repository = definition.weights.repository
@@ -224,22 +278,122 @@ class ModelRegistry:
         if not source.repository or not source.revision:
             return LocalModelInstallation(definition.id, False, False, None)
 
-        repo_dir = self.huggingface_repo_dir(source.repository)
-        snapshot = repo_dir / "snapshots" / source.revision
-        if not snapshot.is_dir():
-            snapshot = self._snapshot_from_local_ref(repo_dir, source.revision) or snapshot
+        return self._inspect_huggingface_snapshot(
+            definition.id,
+            source.repository,
+            source.revision,
+            source.required_files,
+        )
+
+    def _inspect_huggingface_snapshot(
+        self,
+        model_id: str,
+        repository: str,
+        revision: str,
+        required_files: tuple[str, ...],
+    ) -> LocalModelInstallation:
+        repo_dir = self.huggingface_repo_dir(repository)
+        snapshot = self.huggingface_snapshot_dir(repository, revision)
 
         if snapshot.is_dir():
-            return self._inspect_candidate(definition, snapshot, cache_root=repo_dir)
+            return self._inspect_candidate_files(
+                model_id,
+                required_files,
+                snapshot,
+                cache_root=repo_dir,
+            )
 
         incomplete = self._find_incomplete(repo_dir)
         has_cache_state = repo_dir.exists() and self._directory_has_entries(repo_dir)
         return LocalModelInstallation(
-            definition.id,
+            model_id,
             False,
             bool(incomplete or has_cache_state),
             repo_dir if has_cache_state else None,
-            tuple(source.required_files),
+            tuple(required_files),
+            incomplete,
+        )
+
+    def huggingface_snapshots(
+        self,
+        model_id: str,
+    ) -> tuple[tuple[str, str, tuple[str, ...]], ...]:
+        source = self.get(model_id).weights
+        if source.provider != "huggingface" or not source.repository or not source.revision:
+            return ()
+        primary = ((source.repository, source.revision, source.required_files),)
+        supplemental = tuple(
+            (item.repository, item.revision, item.required_files)
+            for item in source.supplemental_sources
+        )
+        return primary + supplemental
+
+    def huggingface_snapshot_dir(self, repository: str, revision: str) -> Path:
+        repo_dir = self.huggingface_repo_dir(repository)
+        snapshot = repo_dir / "snapshots" / revision
+        if not snapshot.is_dir():
+            snapshot = self._snapshot_from_local_ref(repo_dir, revision) or snapshot
+        return snapshot
+
+    def composite_model_dir(self, model_id: str) -> Path:
+        snapshots = self.huggingface_snapshots(model_id)
+        if len(snapshots) < 2:
+            raise ValueError(f"model '{model_id}' is not composite")
+        identity = "\0".join(f"{repository}@{revision}" for repository, revision, _ in snapshots)
+        digest = sha256(identity.encode("utf-8")).hexdigest()[:24]
+        return self.config.composite_models_dir / digest
+
+    def _inspect_composite_source(
+        self,
+        definition: ModelDefinition,
+    ) -> LocalModelInstallation:
+        snapshots = self.huggingface_snapshots(definition.id)
+        inspected = tuple(
+            self._inspect_huggingface_snapshot(definition.id, repository, revision, required)
+            for repository, revision, required in snapshots
+        )
+        composite = self.composite_model_dir(definition.id)
+        all_required = tuple(
+            required for _repository, _revision, manifest in snapshots for required in manifest
+        )
+        incomplete = tuple(
+            path for installation in inspected for path in installation.incomplete_files
+        )
+        sources_complete = all(installation.installed for installation in inspected)
+        if sources_complete and composite.is_dir():
+            candidate = self._inspect_candidate_files(
+                definition.id,
+                all_required,
+                composite,
+                cache_root=composite,
+            )
+            return LocalModelInstallation(
+                candidate.model_id,
+                candidate.installed,
+                candidate.partial,
+                candidate.path,
+                candidate.missing_files,
+                incomplete + candidate.incomplete_files,
+            )
+
+        missing = tuple(
+            f"{repository}:{required}"
+            for (repository, _revision, manifest), installation in zip(
+                snapshots, inspected, strict=True
+            )
+            for required in (
+                installation.missing_files or (() if installation.installed else manifest)
+            )
+        )
+        has_state = any(
+            installation.partial or installation.installed for installation in inspected
+        )
+        return LocalModelInstallation(
+            definition.id,
+            False,
+            has_state,
+            composite if composite.exists() else None,
+            missing or all_required,
             incomplete,
         )
 
@@ -272,7 +426,21 @@ class ModelRegistry:
         *,
         cache_root: Path,
     ) -> LocalModelInstallation:
-        required = definition.weights.required_files
+        return self._inspect_candidate_files(
+            definition.id,
+            definition.weights.required_files,
+            candidate,
+            cache_root=cache_root,
+        )
+
+    def _inspect_candidate_files(
+        self,
+        model_id: str,
+        required: tuple[str, ...],
+        candidate: Path,
+        *,
+        cache_root: Path,
+    ) -> LocalModelInstallation:
         missing = tuple(
             name for name in required if not self._required_file_exists(candidate, name)
         )
@@ -285,7 +453,7 @@ class ModelRegistry:
         installed = not missing
         has_state = self._directory_has_entries(candidate) or bool(incomplete)
         return LocalModelInstallation(
-            definition.id,
+            model_id,
             installed,
             not installed and has_state,
             candidate,

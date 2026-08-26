@@ -59,19 +59,44 @@
       "modality": "video",
       "runtime": "ltx-2-mlx",
       "weights": {
-        "provider": "unconfigured",
-        "repository": null,
-        "revision": null,
-        "required_files": [],
-        "estimated_size_gb": null,
-        "license_url": "https://huggingface.co/mlx-community/ltx-2.5-mlx/blob/851cff741ecbd650b7d417af74c3e7b73f76dd64/LICENSE.md",
-        "acceptable_use_url": "https://static.lightricks.com/legal/ltx-acceptable-use-policy.pdf",
-        "notes": "Registered placeholder only. Dwell has not verified a compatible q8 source, revision, or required-file set; configure and test an explicit source before installation."
+        "provider": "huggingface",
+        "repository": "mlx-community/ltx-2.5-mlx-q8",
+        "revision": "3a80fb22703ef1ca69a89c8f65462b9456b6a361",
+        "required_files": [
+          "config.json",
+          "embedded_config.json",
+          "connector.safetensors",
+          "vae_encoder.safetensors",
+          "vae_decoder.safetensors",
+          "audio_vae.safetensors",
+          "vocoder.safetensors",
+          "spatial_upscaler_x2_v1_1.safetensors",
+          "spatial_upscaler_x2_v1_1_config.json",
+          "gemma4-12b-ltx-v1/config.json",
+          "gemma4-12b-ltx-v1/tokenizer.json",
+          "gemma4-12b-ltx-v1/tokenizer_config.json",
+          "gemma4-12b-ltx-v1/model.safetensors.index.json",
+          "gemma4-12b-ltx-v1/*.safetensors"
+        ],
+        "supplemental_sources": [
+          {
+            "repository": "mlx-community/ltx-2.5-mlx-ditq8",
+            "revision": "5724211c8d1600f15062c9c9667440325f252220",
+            "required_files": [
+              "transformer-distilled.safetensors"
+            ]
+          }
+        ],
+        "estimated_size_gb": 43.4,
+        "license_url": "https://huggingface.co/mlx-community/ltx-2.5-mlx-q8/blob/3a80fb22703ef1ca69a89c8f65462b9456b6a361/LICENSE.md",
+        "acceptable_use_url": "https://huggingface.co/mlx-community/ltx-2.5-mlx-q8/blob/3a80fb22703ef1ca69a89c8f65462b9456b6a361/ltx-acceptable-use-policy-snapshot-2026-08-12.pdf",
+        "notes": "Pinned composite MLX profile: the int8 Gemma-4 encoder tree and int8 distilled DiT are downloaded from separate verified mlx-community snapshots and assembled locally without duplicating weights."
       },
       "profile": {
         "quantization": "q8",
-        "disk": null,
-        "memory": null
+        "disk": "Approximately 43.4 GB (40.4 GiB) for the selected distilled files.",
+        "memory": "Allow at least 24 GB unified memory with low-memory scheduling; 48 GB provides comfortable headroom for Dwell's default distilled pipeline.",
+        "minimum_memory_gb": 24.0
       },
       "runtime_requirements": [
         "macOS on Apple Silicon",

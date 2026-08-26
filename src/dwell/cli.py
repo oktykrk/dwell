@@ -451,6 +451,9 @@ def models_info(model_id: str) -> None:
     }
     for name, value in values.items():
         typer.echo(f"{name}: {value}")
+    for index, source in enumerate(definition.weights.supplemental_sources, start=1):
+        typer.echo(f"supplemental_source_{index}: {source.repository}")
+        typer.echo(f"supplemental_revision_{index}: {source.revision}")
     if definition.weights.notes:
         typer.echo(f"notes: {definition.weights.notes}")
 
@@ -479,6 +482,10 @@ def models_install(
     typer.echo(f"Model: {model_id}")
     typer.echo(f"Source: {payload.get('repository') or payload.get('source') or 'not configured'}")
     typer.echo(f"Revision: {payload.get('revision') or 'not configured'}")
+    supplemental_sources = payload.get("supplemental_sources") or ()
+    for index, source in enumerate(supplemental_sources, start=1):
+        typer.echo(f"Supplemental source {index}: {source['repository']}")
+        typer.echo(f"Supplemental revision {index}: {source['revision']}")
     size = payload.get("estimated_size_gb")
     typer.echo(
         f"Approximate size: {f'{size:g} GB' if isinstance(size, int | float) else 'unknown'}"
@@ -530,6 +537,10 @@ def models_install(
     if required:
         typer.echo("Required files:")
         for name in required:
+            typer.echo(f"  {name}")
+    for index, source in enumerate(supplemental_sources, start=1):
+        typer.echo(f"Supplemental required files {index}:")
+        for name in source.get("required_files") or ():
             typer.echo(f"  {name}")
     if dry_run:
         typer.echo("Dry run only; no download was performed.")

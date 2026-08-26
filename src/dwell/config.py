@@ -113,6 +113,10 @@ class DwellConfig(BaseModel):
         return self.hf_home / "xet"
 
     @property
+    def composite_models_dir(self) -> Path:
+        return self.models_dir / "composites"
+
+    @property
     def registry_file(self) -> Path:
         return self.config_dir / "models.json"
 
@@ -166,6 +170,7 @@ class DwellConfig(BaseModel):
             self.hf_home,
             self.hf_hub_cache,
             self.hf_xet_cache,
+            self.composite_models_dir,
             self.runtimes_dir,
             self.services_dir / "api",
             self.outputs_dir / "video",

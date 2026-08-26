@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import logging
 import os
+import shutil
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ from dwell.domain import (
     Modality,
     ModelDefinition,
     ModelView,
+    SupplementalWeightSource,
     VideoGenerationRequest,
 )
 from dwell.errors import DwellError, model_not_installed
@@ -26,6 +28,10 @@ from dwell.runtimes.base import TextEngine, TextStream
 from dwell.runtimes.registry import RuntimeRegistry
 
 logger = logging.getLogger(__name__)
+
+
+def _has_glob(pattern: str) -> bool:
+    return any(marker in pattern for marker in "*?[")
 
 
 @contextmanager
@@ -78,6 +84,7 @@ class InstallPlan(BaseModel):
     downloadable: bool
     already_installed: bool
     partial: bool
+    supplemental_sources: tuple[SupplementalWeightSource, ...] = ()
     notes: str | None = None
 
 
@@ -122,11 +129,12 @@ class ModelManager:
         definition = self.registry.get(model_id)
         installation = self.registry.installation(model_id)
         source = definition.weights
-        destination = (
-            str(self.registry.huggingface_repo_dir(source.repository))
-            if source.provider == "huggingface" and source.repository
-            else str(self.config.models_dir)
-        )
+        if source.provider == "huggingface" and source.supplemental_sources:
+            destination = str(self.registry.composite_model_dir(model_id))
+        elif source.provider == "huggingface" and source.repository:
+            destination = str(self.registry.huggingface_repo_dir(source.repository))
+        else:
+            destination = str(self.config.models_dir)
         return InstallPlan(
             model_id=model_id,
             provider=source.provider,
@@ -139,6 +147,7 @@ class ModelManager:
             minimum_memory_gb=definition.profile.minimum_memory_gb,
             memory_notes=definition.profile.memory,
             required_files=source.required_files,
+            supplemental_sources=source.supplemental_sources,
             downloadable=self.registry.source_available(model_id),
             already_installed=installation.installed,
             partial=installation.partial,
@@ -180,13 +189,18 @@ class ModelManager:
                     plan.repository,
                     plan.revision,
                 )
-                snapshot_download(
-                    repo_id=plan.repository,
-                    revision=plan.revision,
-                    cache_dir=self.config.hf_hub_cache,
-                    local_files_only=False,
-                    allow_patterns=list(plan.required_files),
-                )
+                for repository, revision, required_files in self.registry.huggingface_snapshots(
+                    model_id
+                ):
+                    snapshot_download(
+                        repo_id=repository,
+                        revision=revision,
+                        cache_dir=self.config.hf_hub_cache,
+                        local_files_only=False,
+                        allow_patterns=list(required_files),
+                    )
+            if plan.supplemental_sources:
+                self._assemble_composite(model_id)
             installation = self.registry.installation(model_id)
             if not installation.installed:
                 raise DwellError(
@@ -199,6 +213,65 @@ class ModelManager:
                 )
             logger.info("Installed and verified model %s", model_id)
             return self.get_model(model_id)
+
+    def _assemble_composite(self, model_id: str) -> None:
+        target = self.registry.composite_model_dir(model_id)
+        parent = self.config.composite_models_dir
+        parent.mkdir(parents=True, exist_ok=True)
+        temporary = parent / f".{target.name}.{os.getpid()}.tmp"
+        stale = parent / f".{target.name}.{os.getpid()}.stale"
+        if temporary.exists() or stale.exists():
+            raise DwellError(
+                "model_in_use",
+                f"A previous composite assembly for '{model_id}' requires cleanup.",
+                details={"temporary": str(temporary), "stale": str(stale)},
+                status_code=409,
+            )
+
+        temporary.mkdir()
+        try:
+            for repository, revision, required_files in self.registry.huggingface_snapshots(
+                model_id
+            ):
+                snapshot = self.registry.huggingface_snapshot_dir(repository, revision)
+                if not snapshot.is_dir():
+                    raise DwellError(
+                        "model_not_installed",
+                        f"Snapshot '{repository}@{revision}' is unavailable after download.",
+                    )
+                for pattern in required_files:
+                    matches = (
+                        sorted(snapshot.glob(pattern))
+                        if _has_glob(pattern)
+                        else [snapshot / pattern]
+                    )
+                    files = [path for path in matches if path.is_file()]
+                    if not files:
+                        raise DwellError(
+                            "model_not_installed",
+                            f"Snapshot '{repository}@{revision}' is missing '{pattern}'.",
+                        )
+                    for source in files:
+                        relative = source.relative_to(snapshot)
+                        destination = temporary / relative
+                        if destination.exists() or destination.is_symlink():
+                            raise DwellError(
+                                "invalid_model_registry",
+                                f"Composite model '{model_id}' maps '{relative}' more than once.",
+                            )
+                        destination.parent.mkdir(parents=True, exist_ok=True)
+                        destination.symlink_to(source.resolve(strict=True))
+
+            if target.exists():
+                target.rename(stale)
+            temporary.rename(target)
+            if stale.exists():
+                shutil.rmtree(stale)
+        finally:
+            if temporary.exists():
+                shutil.rmtree(temporary)
+            if stale.exists() and not target.exists():
+                stale.rename(target)
 
     def remove(self, model_id: str) -> ModelView:
         definition = self.registry.get(model_id)
@@ -267,6 +340,8 @@ class ModelManager:
             )
 
         self._ensure_repository_not_shared(definition)
+        if definition.weights.supplemental_sources:
+            return self._remove_composite_locked(definition, installation.path)
         commit_hash = installation.path.name if installation.path is not None else ""
         from huggingface_hub import scan_cache_dir
 
@@ -296,17 +371,72 @@ class ModelManager:
         strategy.execute()
         return self.get_model(model_id)
 
+    def _remove_composite_locked(
+        self,
+        definition: ModelDefinition,
+        installation_path: Path | None,
+    ) -> ModelView:
+        expected_path = self.registry.composite_model_dir(definition.id)
+        if installation_path is None or installation_path.resolve() != expected_path.resolve():
+            raise DwellError(
+                "invalid_request",
+                "Conservative removal refused: the composite path was not recognized.",
+            )
+
+        from huggingface_hub import scan_cache_dir
+
+        cache = scan_cache_dir(self.config.hf_hub_cache)
+        commit_hashes: list[str] = []
+        for repository, revision, _required_files in self.registry.huggingface_snapshots(
+            definition.id
+        ):
+            matching = [
+                cached_revision
+                for repo in cache.repos
+                if repo.repo_type == "model" and repo.repo_id == repository
+                for cached_revision in repo.revisions
+                if cached_revision.commit_hash == revision
+            ]
+            if len(matching) != 1:
+                raise DwellError(
+                    "invalid_request",
+                    (
+                        "Conservative removal refused: the exact cache revision "
+                        f"for '{repository}' was not uniquely identified."
+                    ),
+                )
+            commit_hashes.append(matching[0].commit_hash)
+
+        strategy = cache.delete_revisions(*commit_hashes)
+        logger.info(
+            "Removing composite model %s revisions %s (%s)",
+            definition.id,
+            ", ".join(commit_hashes),
+            strategy.expected_freed_size_str,
+        )
+        shutil.rmtree(expected_path)
+        strategy.execute()
+        return self.get_model(definition.id)
+
     def _ensure_repository_not_shared(self, definition: ModelDefinition) -> None:
+        repositories = {
+            repository
+            for repository, _revision, _required_files in self.registry.huggingface_snapshots(
+                definition.id
+            )
+        }
         for other in self.registry.list():
             if other.id == definition.id:
                 continue
-            if (
-                other.weights.provider == "huggingface"
-                and other.weights.repository == definition.weights.repository
-                and (
-                    self.registry.installation(other.id).installed
-                    or self.registry.installation(other.id).partial
+            other_repositories = {
+                repository
+                for repository, _revision, _required_files in self.registry.huggingface_snapshots(
+                    other.id
                 )
+            }
+            if repositories & other_repositories and (
+                self.registry.installation(other.id).installed
+                or self.registry.installation(other.id).partial
             ):
                 raise DwellError(
                     "model_in_use",
