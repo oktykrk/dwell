@@ -124,7 +124,8 @@ def test_setup_cli_selects_read_only_check_mode(
         def __init__(self, _config) -> None:
             pass
 
-        def run(self, mode: SetupMode) -> SetupReport:
+        def run(self, mode: SetupMode, *, force: bool = False) -> SetupReport:
+            assert force is False
             calls.append(mode)
             return SetupReport(mode, False, True, ("Runtime: healthy",))
 
@@ -143,6 +144,15 @@ def test_setup_cli_rejects_conflicting_modes_without_creating_home(tmp_path: Pat
 
     assert result.exit_code == 1
     assert "Use only one" in result.output
+    assert not home.exists()
+
+
+def test_setup_cli_rejects_force_without_upgrade(tmp_path: Path) -> None:
+    home = tmp_path / "dwell"
+    result = runner.invoke(app, ["setup", "--force"], env=_env(home))
+
+    assert result.exit_code == 1
+    assert "--force may only be used with --upgrade" in result.output
     assert not home.exists()
 
 
