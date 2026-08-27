@@ -203,6 +203,7 @@ class FakeRunner:
                 "--project",
                 str(cwd),
                 "--locked",
+                "--no-editable",
                 "--python",
                 "3.11",
             ]

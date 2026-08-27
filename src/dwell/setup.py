@@ -1796,6 +1796,10 @@ class SetupManager:
                 "--project",
                 str(self.runtime_dir),
                 "--locked",
+                # Probing an editable install imports from the integrity-checked
+                # source tree and leaves __pycache__ files behind, making a fresh
+                # runtime immediately appear modified.
+                "--no-editable",
                 "--python",
                 self.runtime.python,
             ],
