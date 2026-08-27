@@ -46,10 +46,15 @@ def _fake_uv(path: Path) -> Path:
         test -z "${UV_PYTHON_INSTALL_MIRROR:-}"
         test -z "${UV_NO_VERIFY_HASHES:-}"
         test -z "${PIP_CONFIG_FILE:-}"
+        quiet=""
+        if [ "${1:-}" = "--quiet" ]; then
+            quiet="--quiet"
+            shift
+        fi
         if [ "${1:-}" = "--no-config" ]; then
             shift
         fi
-        printf '%s\n' "$*" >>"$DWELL_TEST_UV_LOG"
+        printf '%s %s\n' "$quiet" "$*" >>"$DWELL_TEST_UV_LOG"
         command=$1
         shift
         case "$command" in
@@ -298,6 +303,7 @@ def test_installs_self_contained_cli_without_source_build(
     ]
 
     uv_log = install_fixture.uv_log.read_text(encoding="utf-8")
+    assert uv_log.count("--quiet ") == 4
     assert "python install 3.11.15 --no-bin" in uv_log
     assert "--require-hashes --no-build --strict" in uv_log
     assert "--managed-python --no-deps --no-build" in uv_log

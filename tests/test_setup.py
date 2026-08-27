@@ -221,7 +221,9 @@ class FakeRunner:
             python = bin_dir / "python"
             cli = bin_dir / "ltx-2-mlx"
             (cwd / ".venv" / "pyvenv.cfg").write_text(
-                "implementation = CPython\nversion_info = 3.11.99\n",
+                # uv may record the requested minor version rather than the
+                # interpreter's full patch version.
+                "implementation = CPython\nversion_info = 3.11\n",
                 encoding="utf-8",
             )
             python.write_text("#!/bin/sh\necho 'Python 3.11.99'\n", encoding="utf-8")
@@ -1091,9 +1093,10 @@ def test_failed_upgrade_restores_previous_runtime(tmp_path: Path) -> None:
     second_commit = _commit(source, "runtime.txt", "two\n")
     manager, _runner = _manager(config, _spec(source, second_commit), FakeRunner(fail_sync=True))
 
-    with pytest.raises(DwellError, match="previous runtime was restored"):
+    with pytest.raises(DwellError, match="previous runtime was restored") as raised:
         manager.run(SetupMode.UPGRADE)
 
+    assert "Cause: uv sync --locked failed: simulated sync failure" in str(raised.value)
     assert _git(manager.runtime_dir, "rev-parse", "HEAD") == first_commit
     assert (manager.runtime_dir / ".venv/bin/ltx-2-mlx").is_file()
     assert not list(config.runtimes_dir.glob(".ltx-2-mlx.backup-*"))

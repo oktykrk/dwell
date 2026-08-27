@@ -979,7 +979,8 @@ class SetupManager:
                 self._rollback_completed_upgrade(outcome, exc)
                 raise DwellError(
                     "setup_failed",
-                    "Runtime upgrade verification failed; the previous runtime was restored.",
+                    "Runtime upgrade verification failed; the previous runtime was restored. "
+                    f"Cause: {exc}",
                     details={"error": str(exc)},
                 ) from exc
             raise
@@ -1358,8 +1359,11 @@ class SetupManager:
             for key, value in (line.split("=", 1),)
             if key.strip() in {"version", "version_info"}
         }
-        expected_python = f"{self.runtime.python}."
-        if not any(version.startswith(expected_python) for version in versions):
+        expected_python = self.runtime.python
+        if not any(
+            version == expected_python or version.startswith(f"{expected_python}.")
+            for version in versions
+        ):
             return False
         lines = cli_text.splitlines()
         # distlib/uv uses a /bin/sh launcher when the absolute interpreter path
@@ -1599,7 +1603,7 @@ class SetupManager:
                 ) from exc
             raise DwellError(
                 "setup_failed",
-                "Runtime upgrade failed; the previous runtime was restored.",
+                f"Runtime upgrade failed; the previous runtime was restored. Cause: {exc}",
                 details={"error": str(exc)},
             ) from exc
         finally:
@@ -1814,16 +1818,28 @@ class SetupManager:
         # Every caller invokes this immediately after a pinned `uv sync`. Only
         # then is it safe and useful to execute the generated console script.
         inspection = self.inspect(probe_venv=False)
-        probe_passed = (
-            inspection.source_valid
-            and self._venv_is_structurally_healthy(self.runtime_dir)
-            and self._venv_probe_passes(self.runtime_dir)
+        structure_valid = self._venv_is_structurally_healthy(self.runtime_dir)
+        cli_valid = (
+            self._venv_probe_passes(self.runtime_dir)
+            if inspection.source_valid and structure_valid
+            else False
         )
-        if not probe_passed:
+        if not inspection.source_valid or not structure_valid or not cli_valid:
+            if not inspection.source_valid:
+                message = "Runtime source verification failed after setup."
+            elif not structure_valid:
+                message = "Runtime virtual environment structure verification failed after setup."
+            else:
+                message = "Runtime CLI verification failed after setup."
             raise DwellError(
                 "runtime_unhealthy",
-                "Runtime verification failed after setup.",
-                details={"problems": inspection.problems},
+                message,
+                details={
+                    "problems": inspection.problems,
+                    "source_valid": inspection.source_valid,
+                    "structure_valid": structure_valid,
+                    "cli_valid": cli_valid,
+                },
             )
         _atomic_write_json(
             self.runtime_dir / ".venv" / _VENV_PROVENANCE_FILE,

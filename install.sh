@@ -700,17 +700,17 @@ if [ "$already_current" -eq 0 ]; then
     release_dir=$(mktemp -d "$releases_dir/$version-$release_prefix.XXXXXX")
     release_created=1
 
-    "$UV_BIN" --no-config python install "$UV_PYTHON_VERSION" --no-bin \
+    "$UV_BIN" --quiet --no-config python install "$UV_PYTHON_VERSION" --no-bin \
         --install-dir "$python_root"
-    "$UV_BIN" --no-config venv "$release_dir" --python "$UV_PYTHON_VERSION" \
+    "$UV_BIN" --quiet --no-config venv "$release_dir" --python "$UV_PYTHON_VERSION" \
         --managed-python
-    "$UV_BIN" --no-config pip sync "$requirements" \
+    "$UV_BIN" --quiet --no-config pip sync "$requirements" \
         --python "$release_dir/bin/python" \
         --managed-python \
         --require-hashes \
         --no-build \
         --strict
-    "$UV_BIN" --no-config pip install "$wheel" \
+    "$UV_BIN" --quiet --no-config pip install "$wheel" \
         --python "$release_dir/bin/python" \
         --managed-python \
         --no-deps \
